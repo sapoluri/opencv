@@ -1,4 +1,4 @@
-ocv_install_example_src(tapi *.cpp *.hpp CMakeLists.txt)
+ocv_install_example_src(tapi *.cpp *.hpp *.md CMakeLists.txt)
 
 set(OPENCV_TAPI_SAMPLES_REQUIRED_DEPS
   opencv_core
