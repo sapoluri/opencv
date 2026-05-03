@@ -73,6 +73,7 @@
 #include <opencv2/core/hal/hal.hpp>
 #include <opencv2/core/utils/tls.hpp>
 #include <opencv2/core/utils/logger.hpp>
+#include <cstdlib>
 
 #ifdef HAVE_OPENCL
 #include "opencl_kernels_features2d.hpp"
@@ -714,6 +715,7 @@ static bool siftOclFindScaleSpaceExtrema(
     SIFT_Impl* impl,
     const std::vector<Mat>& gauss_pyr,
     const std::vector<Mat>& dog_pyr,
+    const std::vector<UMat>& udog_pyr,
     std::vector<KeyPoint>& keypoints )
 {
     const int nOctaveLayers = impl->getNOctaveLayers();
@@ -730,10 +732,9 @@ static bool siftOclFindScaleSpaceExtrema(
         for( int i = 1; i <= nOctaveLayers; i++ )
         {
             const int idx = o*(nOctaveLayers+2)+i;
-            UMat uPrev, uCur, uNext;
-            dog_pyr[idx-1].copyTo(uPrev);
-            dog_pyr[idx].copyTo(uCur);
-            dog_pyr[idx+1].copyTo(uNext);
+            const UMat& uPrev = udog_pyr[(size_t)(idx - 1)];
+            const UMat& uCur = udog_pyr[(size_t)idx];
+            const UMat& uNext = udog_pyr[(size_t)(idx + 1)];
 
             UMat uCounter, uOutRc(kSiftOclMaxCandidates, 2, CV_32S);
             int nCand = 0;
@@ -784,6 +785,22 @@ static bool siftTryOpenCLDetectAndCompute(
     if( uimage.empty() || uimage.depth() != CV_8U )
         return false;
 
+    // Skip OpenCL SIFT on very small inputs: host↔device and kernel launch costs dominate.
+    // Override with OPENCV_SIFT_OPENCL_FORCE=1, or tune with OPENCV_SIFT_OPENCL_MIN_PIXELS / OPENCV_SIFT_OPENCL_MIN_SIDE.
+    if( !std::getenv("OPENCV_SIFT_OPENCL_FORCE") )
+    {
+        const int64_t pixels = (int64_t)uimage.cols * uimage.rows;
+        const int mn = std::min(uimage.cols, uimage.rows);
+        int minPixels = 512 * 384; // ~0.2 MP default crossover hint
+        int minSide = 384;
+        if( const char* e = std::getenv("OPENCV_SIFT_OPENCL_MIN_PIXELS") )
+            minPixels = std::max(1, atoi(e));
+        if( const char* e = std::getenv("OPENCV_SIFT_OPENCL_MIN_SIDE") )
+            minSide = std::max(32, atoi(e));
+        if( pixels < (int64_t)minPixels || mn < minSide )
+            return false;
+    }
+
     int nOctaves = actualNOctaves > 0 ? actualNOctaves : cvRound(std::log( (double)std::min( uimage.cols, uimage.rows ) ) / std::log(2.) - 2) - firstOctave;
 
     UMat ubase = siftCreateInitialImageUMat(uimage, firstOctave < 0, (float)impl->getSigma(), impl->getEnablePreciseUpscale());
@@ -800,7 +817,7 @@ static bool siftTryOpenCLDetectAndCompute(
         siftUMatPyrToMat(udogpyr, dogpyr);
 
         keypoints.clear();
-        if( !siftOclFindScaleSpaceExtrema(impl, gpyr, dogpyr, keypoints) )
+        if( !siftOclFindScaleSpaceExtrema(impl, gpyr, dogpyr, udogpyr, keypoints) )
         {
             keypoints.clear();
             impl->findScaleSpaceExtrema(gpyr, dogpyr, keypoints);
