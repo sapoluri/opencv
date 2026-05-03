@@ -74,6 +74,11 @@
 #include <opencv2/core/utils/tls.hpp>
 #include <opencv2/core/utils/logger.hpp>
 
+#ifdef HAVE_OPENCL
+#include "opencl_kernels_features2d.hpp"
+#include "sift_detail.hpp"
+#endif
+
 #include "sift.simd.hpp"
 #include "sift.simd_declarations.hpp" // defines CV_CPU_DISPATCH_MODES_ALL=AVX2,...,BASELINE based on CMakeLists.txt content
 
@@ -107,6 +112,8 @@ public:
                     std::vector<KeyPoint>& keypoints,
                     OutputArray descriptors,
                     bool useProvidedKeypoints = false) CV_OVERRIDE;
+
+    bool getEnablePreciseUpscale() const { return enable_precise_upscale; }
 
     void buildGaussianPyramid( const Mat& base, std::vector<Mat>& pyr, int nOctaves ) const;
     void buildDoGPyramid( const std::vector<Mat>& pyr, std::vector<Mat>& dogpyr ) const;
@@ -469,6 +476,366 @@ static void calcDescriptors(const std::vector<Mat>& gpyr, const std::vector<KeyP
     parallel_for_(Range(0, static_cast<int>(keypoints.size())), calcDescriptorsComputer(gpyr, keypoints, descriptors, nOctaveLayers, firstOctave));
 }
 
+#ifdef HAVE_OPENCL
+namespace {
+
+static const int kSiftOclMaxCandidates = 1 << 20;
+
+static UMat siftCreateInitialImageUMat( const UMat& img, bool doubleImageSize, float sigma, bool enable_precise_upscale )
+{
+    CV_TRACE_FUNCTION();
+    UMat gray, gray_fpt;
+    if( img.channels() == 3 || img.channels() == 4 )
+    {
+        cvtColor(img, gray, COLOR_BGR2GRAY);
+        gray.convertTo(gray_fpt, CV_32F, (float)sift_detail::SIFT_FIXPT_SCALE, 0);
+    }
+    else
+        img.convertTo(gray_fpt, CV_32F, (float)sift_detail::SIFT_FIXPT_SCALE, 0);
+
+    const float kInitSigma = 0.5f;
+    float sig_diff;
+
+    if( doubleImageSize )
+    {
+        sig_diff = sqrtf( std::max(sigma * sigma - kInitSigma * kInitSigma * 4, 0.01f) );
+
+        UMat dbl;
+        if (enable_precise_upscale) {
+            dbl.create(Size(gray_fpt.cols*2, gray_fpt.rows*2), gray_fpt.type());
+            Mat H = Mat::zeros(2, 3, CV_32F);
+            H.at<float>(0, 0) = 0.5f;
+            H.at<float>(1, 1) = 0.5f;
+            warpAffine(gray_fpt, dbl, H, dbl.size(), INTER_LINEAR | WARP_INVERSE_MAP, BORDER_REFLECT);
+        } else {
+            resize(gray_fpt, dbl, Size(gray_fpt.cols*2, gray_fpt.rows*2), 0, 0, INTER_LINEAR);
+        }
+        UMat result;
+        GaussianBlur(dbl, result, Size(), sig_diff, sig_diff);
+        return result;
+    }
+    else
+    {
+        sig_diff = sqrtf( std::max(sigma * sigma - kInitSigma * kInitSigma, 0.01f) );
+        UMat result;
+        GaussianBlur(gray_fpt, result, Size(), sig_diff, sig_diff);
+        return result;
+    }
+}
+
+static void siftBuildGaussianPyramidUMat( const UMat& base, std::vector<UMat>& pyr, int nOctaves, int nOctaveLayers, double sigma )
+{
+    CV_TRACE_FUNCTION();
+    std::vector<double> sig(nOctaveLayers + 3);
+    pyr.resize(nOctaves*(nOctaveLayers + 3));
+    sig[0] = sigma;
+    double k = std::pow( 2., 1. / nOctaveLayers );
+    for( int i = 1; i < nOctaveLayers + 3; i++ )
+    {
+        double sig_prev = std::pow(k, (double)(i-1))*sigma;
+        double sig_total = sig_prev*k;
+        sig[i] = std::sqrt(sig_total*sig_total - sig_prev*sig_prev);
+    }
+
+    for( int o = 0; o < nOctaves; o++ )
+    {
+        for( int i = 0; i < nOctaveLayers + 3; i++ )
+        {
+            UMat& dst = pyr[o*(nOctaveLayers + 3) + i];
+            if( o == 0  &&  i == 0 )
+                dst = base;
+            else if( i == 0 )
+            {
+                const UMat& src = pyr[(o-1)*(nOctaveLayers + 3) + nOctaveLayers];
+                resize(src, dst, Size(src.cols/2, src.rows/2), 0, 0, INTER_NEAREST);
+            }
+            else
+            {
+                const UMat& src = pyr[o*(nOctaveLayers + 3) + i-1];
+                GaussianBlur(src, dst, Size(), sig[i], sig[i]);
+            }
+        }
+    }
+}
+
+class siftBuildDoGPyramidUMatComputer : public ParallelLoopBody
+{
+public:
+    siftBuildDoGPyramidUMatComputer( int _nOctaveLayers, const std::vector<UMat>& _gpyr, std::vector<UMat>& _dogpyr)
+        : nOctaveLayers(_nOctaveLayers), gpyr(_gpyr), dogpyr(_dogpyr) { }
+
+    void operator()( const cv::Range& range ) const CV_OVERRIDE
+    {
+        for( int a = range.start; a < range.end; a++ )
+        {
+            const int o = a / (nOctaveLayers + 2);
+            const int i = a % (nOctaveLayers + 2);
+            const UMat& src1 = gpyr[o*(nOctaveLayers + 3) + i];
+            const UMat& src2 = gpyr[o*(nOctaveLayers + 3) + i + 1];
+            UMat& dst = dogpyr[o*(nOctaveLayers + 2) + i];
+            subtract(src2, src1, dst, noArray(), CV_32F);
+        }
+    }
+private:
+    int nOctaveLayers;
+    const std::vector<UMat>& gpyr;
+    std::vector<UMat>& dogpyr;
+};
+
+static void siftBuildDoGPyramidUMat( const std::vector<UMat>& gpyr, std::vector<UMat>& dogpyr, int nOctaveLayers )
+{
+    CV_TRACE_FUNCTION();
+    int nOctaves = (int)gpyr.size()/(nOctaveLayers + 3);
+    dogpyr.resize( nOctaves*(nOctaveLayers + 2) );
+    parallel_for_(Range(0, nOctaves * (nOctaveLayers + 2)), siftBuildDoGPyramidUMatComputer(nOctaveLayers, gpyr, dogpyr));
+}
+
+static void siftUMatPyrToMat( const std::vector<UMat>& u, std::vector<Mat>& m )
+{
+    m.resize(u.size());
+    for( size_t i = 0; i < u.size(); i++ )
+        u[i].copyTo(m[i]);
+}
+
+static bool siftOclCollectCandidates(
+    const UMat& prev, const UMat& cur, const UMat& next,
+    float threshold,
+    UMat& uCounter,
+    UMat& uOutRc,
+    int& outCount )
+{
+    ocl::Kernel ker("SIFT_collectExtremaCandidates", ocl::features2d::sift_oclsrc);
+    if( ker.empty() )
+        return false;
+
+    uCounter.create(1, 1, CV_32S);
+    uCounter.setTo(Scalar(0));
+
+    int rows = cur.rows, cols = cur.cols;
+    int prev_step = (int)prev.step, cur_step = (int)cur.step, next_step = (int)next.step;
+
+    size_t globalsize[] = { (size_t)std::max(1, cols - 2 * sift_detail::SIFT_IMG_BORDER),
+                            (size_t)std::max(1, rows - 2 * sift_detail::SIFT_IMG_BORDER) };
+    ocl::Device dev = ocl::Device::getDefault();
+    size_t localsize[2] = { 0, 0 };
+    if( dev.isIntel() && (dev.type() & ocl::Device::TYPE_GPU) &&
+        (globalsize[0] % 8u == 0u) && (globalsize[1] % 8u == 0u) )
+    {
+        localsize[0] = 8;
+        localsize[1] = 8;
+    }
+
+    bool ok = ker.args(
+        ocl::KernelArg::ReadOnlyNoSize(prev), prev_step,
+        ocl::KernelArg::ReadOnlyNoSize(cur), cur_step,
+        ocl::KernelArg::ReadOnlyNoSize(next), next_step,
+        rows, cols,
+        threshold,
+        ocl::KernelArg::ReadWrite(uCounter),
+        ocl::KernelArg::PtrWriteOnly(uOutRc),
+        kSiftOclMaxCandidates
+    ).run(2, globalsize, (localsize[0] && (globalsize[0] >= localsize[0]) && (globalsize[1] >= localsize[1])) ? localsize : 0, true);
+
+    if( !ok )
+        return false;
+
+    Mat cnt;
+    uCounter.copyTo(cnt);
+    outCount = cnt.at<int>(0);
+    if( outCount <= 0 )
+        return true;
+    if( outCount >= kSiftOclMaxCandidates - 4096 )
+        return false;
+    return true;
+}
+
+class siftProcessCandidatesBody : public ParallelLoopBody
+{
+public:
+    siftProcessCandidatesBody(
+        int _o, int _i, int _nOctaveLayers,
+        double _contrastThreshold, double _edgeThreshold, double _sigma,
+        const std::vector<Mat>* _gauss_pyr,
+        const std::vector<Mat>* _dog_pyr,
+        const int* _rc,
+        int _n,
+        TLSData<std::vector<KeyPoint> >* _tls)
+        : o(_o), i(_i), nOctaveLayers(_nOctaveLayers),
+          contrastThreshold(_contrastThreshold), edgeThreshold(_edgeThreshold), sigma(_sigma),
+          gauss_pyr(_gauss_pyr), dog_pyr(_dog_pyr), rc(_rc), n(_n), tls(_tls) {}
+
+    void operator()( const cv::Range& range ) const CV_OVERRIDE
+    {
+        std::vector<KeyPoint>& kpts = tls->getRef();
+        static const int nOri = sift_detail::SIFT_ORI_HIST_BINS;
+        float hist[nOri];
+        for( int k = range.start; k < range.end; k++ )
+        {
+            int r1 = rc[k * 2], c1 = rc[k * 2 + 1];
+            KeyPoint kpt;
+            int layer = i;
+            if( !sift_detail::adjustLocalExtrema(*dog_pyr, kpt, o, layer, r1, c1,
+                    nOctaveLayers, (float)contrastThreshold, (float)edgeThreshold, (float)sigma) )
+                continue;
+            float scl_octv = kpt.size*0.5f/(1 << o);
+            float omax = sift_detail::calcOrientationHist((*gauss_pyr)[o*(nOctaveLayers+3) + layer],
+                    Point(c1, r1),
+                    cvRound(sift_detail::SIFT_ORI_RADIUS * scl_octv),
+                    sift_detail::SIFT_ORI_SIG_FCTR * scl_octv,
+                    hist, nOri);
+            float mag_thr = (float)(omax * sift_detail::SIFT_ORI_PEAK_RATIO);
+            for( int j = 0; j < nOri; j++ )
+            {
+                int l = j > 0 ? j - 1 : nOri - 1;
+                int r2 = j < nOri-1 ? j + 1 : 0;
+                if( hist[j] > hist[l]  &&  hist[j] > hist[r2]  &&  hist[j] >= mag_thr )
+                {
+                    float bin = j + 0.5f * (hist[l]-hist[r2]) / (hist[l] - 2*hist[j] + hist[r2]);
+                    bin = bin < 0 ? nOri + bin : bin >= nOri ? bin - nOri : bin;
+                    kpt.angle = 360.f - (float)((360.f/nOri) * bin);
+                    if(std::abs(kpt.angle - 360.f) < FLT_EPSILON)
+                        kpt.angle = 0.f;
+                    kpts.push_back(kpt);
+                }
+            }
+        }
+    }
+private:
+    int o, i, nOctaveLayers;
+    double contrastThreshold, edgeThreshold, sigma;
+    const std::vector<Mat>* gauss_pyr;
+    const std::vector<Mat>* dog_pyr;
+    const int* rc;
+    int n;
+    TLSData<std::vector<KeyPoint> >* tls;
+};
+
+static bool siftOclFindScaleSpaceExtrema(
+    SIFT_Impl* impl,
+    const std::vector<Mat>& gauss_pyr,
+    const std::vector<Mat>& dog_pyr,
+    std::vector<KeyPoint>& keypoints )
+{
+    const int nOctaveLayers = impl->getNOctaveLayers();
+    const double contrastThreshold = impl->getContrastThreshold();
+    const double edgeThreshold = impl->getEdgeThreshold();
+    const double sigma = impl->getSigma();
+    const int threshold = cvFloor(0.5 * contrastThreshold / nOctaveLayers * 255 * sift_detail::SIFT_FIXPT_SCALE);
+
+    const int nOctaves = (int)gauss_pyr.size()/(nOctaveLayers + 3);
+    TLSDataAccumulator<std::vector<KeyPoint> > tls_kpts_struct;
+
+    for( int o = 0; o < nOctaves; o++ )
+    {
+        for( int i = 1; i <= nOctaveLayers; i++ )
+        {
+            const int idx = o*(nOctaveLayers+2)+i;
+            UMat uPrev, uCur, uNext;
+            dog_pyr[idx-1].copyTo(uPrev);
+            dog_pyr[idx].copyTo(uCur);
+            dog_pyr[idx+1].copyTo(uNext);
+
+            UMat uCounter, uOutRc(kSiftOclMaxCandidates, 2, CV_32S);
+            int nCand = 0;
+            if( !siftOclCollectCandidates(uPrev, uCur, uNext, (float)threshold, uCounter, uOutRc, nCand) )
+                return false;
+
+            if( nCand > 0 )
+            {
+                Mat rcHost;
+                uOutRc.rowRange(0, nCand).copyTo(rcHost);
+                const int* rc = rcHost.ptr<int>();
+
+                parallel_for_(Range(0, nCand), siftProcessCandidatesBody(
+                    o, i, nOctaveLayers, contrastThreshold, edgeThreshold, sigma,
+                    &gauss_pyr, &dog_pyr, rc, nCand, &tls_kpts_struct));
+            }
+        }
+    }
+
+    std::vector<std::vector<KeyPoint>*> kpt_vecs;
+    tls_kpts_struct.gather(kpt_vecs);
+    for (size_t i = 0; i < kpt_vecs.size(); ++i) {
+        keypoints.insert(keypoints.end(), kpt_vecs[i]->begin(), kpt_vecs[i]->end());
+    }
+    return true;
+}
+
+static bool siftTryOpenCLDetectAndCompute(
+    SIFT_Impl* impl,
+    InputArray _image,
+    InputArray _mask,
+    std::vector<KeyPoint>& keypoints,
+    OutputArray _descriptors,
+    bool useProvidedKeypoints,
+    int firstOctave,
+    int actualNOctaves,
+    int actualNLayers )
+{
+    CV_UNUSED(actualNLayers);
+    if( !ocl::useOpenCL() || !_image.isUMat() )
+        return false;
+    if( impl->descriptorType() != CV_32F )
+        return false;
+
+    UMat uimage = _image.getUMat();
+    Mat mask = _mask.getMat();
+
+    if( uimage.empty() || uimage.depth() != CV_8U )
+        return false;
+
+    int nOctaves = actualNOctaves > 0 ? actualNOctaves : cvRound(std::log( (double)std::min( uimage.cols, uimage.rows ) ) / std::log(2.) - 2) - firstOctave;
+
+    UMat ubase = siftCreateInitialImageUMat(uimage, firstOctave < 0, (float)impl->getSigma(), impl->getEnablePreciseUpscale());
+    std::vector<UMat> ugpyr;
+    siftBuildGaussianPyramidUMat(ubase, ugpyr, nOctaves, impl->getNOctaveLayers(), impl->getSigma());
+
+    std::vector<Mat> gpyr, dogpyr;
+    siftUMatPyrToMat(ugpyr, gpyr);
+
+    if( !useProvidedKeypoints )
+    {
+        std::vector<UMat> udogpyr;
+        siftBuildDoGPyramidUMat(ugpyr, udogpyr, impl->getNOctaveLayers());
+        siftUMatPyrToMat(udogpyr, dogpyr);
+
+        keypoints.clear();
+        if( !siftOclFindScaleSpaceExtrema(impl, gpyr, dogpyr, keypoints) )
+        {
+            keypoints.clear();
+            impl->findScaleSpaceExtrema(gpyr, dogpyr, keypoints);
+        }
+        KeyPointsFilter::removeDuplicatedSorted( keypoints );
+        if( impl->getNFeatures() > 0 )
+            KeyPointsFilter::retainBest(keypoints, impl->getNFeatures());
+
+        if( firstOctave < 0 )
+            for( size_t i = 0; i < keypoints.size(); i++ )
+            {
+                KeyPoint& kpt = keypoints[i];
+                float scale = 1.f/(float)(1 << -firstOctave);
+                kpt.octave = (kpt.octave & ~255) | ((kpt.octave + firstOctave) & 255);
+                kpt.pt *= scale;
+                kpt.size *= scale;
+            }
+
+        if( !mask.empty() )
+            KeyPointsFilter::runByPixelsMask( keypoints, mask );
+    }
+
+    if( _descriptors.needed() )
+    {
+        int dsize = impl->descriptorSize();
+        _descriptors.create((int)keypoints.size(), dsize, impl->descriptorType());
+        Mat descriptors = _descriptors.getMat();
+        calcDescriptors(gpyr, keypoints, descriptors, impl->getNOctaveLayers(), firstOctave);
+    }
+    return true;
+}
+
+} // namespace
+#endif // HAVE_OPENCL
+
 //////////////////////////////////////////////////////////////////////////////////////////
 
 SIFT_Impl::SIFT_Impl( int _nfeatures, int _nOctaveLayers,
@@ -506,12 +873,11 @@ void SIFT_Impl::detectAndCompute(InputArray _image, InputArray _mask,
     CV_TRACE_FUNCTION();
 
     int firstOctave = -1, actualNOctaves = 0, actualNLayers = 0;
-    Mat image = _image.getMat(), mask = _mask.getMat();
 
-    if( image.empty() || image.depth() != CV_8U )
+    if( _image.empty() || _image.depth() != CV_8U )
         CV_Error( Error::StsBadArg, "image is empty or has incorrect depth (!=CV_8U)" );
 
-    if( !mask.empty() && mask.type() != CV_8UC1 )
+    if( !_mask.empty() && _mask.type() != CV_8UC1 )
         CV_Error( Error::StsBadArg, "mask has incorrect type (!=CV_8UC1)" );
 
     if( useProvidedKeypoints )
@@ -532,6 +898,17 @@ void SIFT_Impl::detectAndCompute(InputArray _image, InputArray _mask,
         CV_Assert( firstOctave >= -1 && actualNLayers <= nOctaveLayers );
         actualNOctaves = maxOctave - firstOctave + 1;
     }
+
+#ifdef HAVE_OPENCL
+    if( siftTryOpenCLDetectAndCompute(this, _image, _mask, keypoints, _descriptors, useProvidedKeypoints,
+            firstOctave, actualNOctaves, actualNLayers) )
+    {
+        CV_IMPL_ADD(CV_IMPL_OCL);
+        return;
+    }
+#endif
+
+    Mat image = _image.getMat(), mask = _mask.getMat();
 
     Mat base = createInitialImage(image, firstOctave < 0, (float)sigma, enable_precise_upscale);
     std::vector<Mat> gpyr;

@@ -262,6 +262,12 @@ typedef AffineFeature AffineDescriptorExtractor;
 
 /** @brief Class for extracting keypoints and computing descriptors using the Scale Invariant Feature Transform
 (SIFT) algorithm by D. Lowe @cite Lowe04 .
+
+When OpenCV is built with OpenCL, passing cv::UMat inputs to detect(), compute(), or detectAndCompute()
+while OpenCL is enabled (see cv::ocl::setUseOpenCL) may run parts of the pipeline (Gaussian / DoG
+pyramids and an OpenCL extrema prefilter) on the OpenCL device. The implementation automatically falls
+back to the CPU if OpenCL is disabled, kernels are unavailable, or descriptorType is CV_8U. Numerical
+results are expected to agree with the cv::Mat path within small floating-point tolerances.
 */
 class CV_EXPORTS_W SIFT : public Feature2D
 {

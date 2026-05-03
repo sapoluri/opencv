@@ -67,6 +67,47 @@ OCL_INSTANTIATE_TEST_CASE_P(AKAZE, Feature2DFixture,
 OCL_INSTANTIATE_TEST_CASE_P(AKAZE_DESCRIPTOR_KAZE, Feature2DFixture,
     testing::Combine(testing::Values([]() { return AKAZE::create(AKAZE::DESCRIPTOR_KAZE); }), TEST_IMAGES));
 
+// SIFT: UMat path may use OpenCL (pyramid + extrema prefilter); allow looser float descriptor / angle tolerances vs CPU Mat path.
+PARAM_TEST_CASE(Feature2DSIFT_OCL_Fixture, std::string)
+{
+    std::string filename;
+    Mat image, descriptors;
+    vector<KeyPoint> keypoints;
+    UMat uimage, udescriptors;
+    vector<KeyPoint> ukeypoints;
+    Ptr<Feature2D> feature;
+
+    virtual void SetUp()
+    {
+        feature = SIFT::create();
+        filename = GET_PARAM(0);
+        image = readImage(filename);
+        ASSERT_FALSE(image.empty());
+        image.copyTo(uimage);
+        OCL_OFF(feature->detect(image, keypoints));
+        OCL_ON(feature->detect(uimage, ukeypoints));
+        OCL_OFF(feature->compute(image, keypoints, descriptors));
+        OCL_ON(feature->compute(uimage, keypoints, udescriptors));
+    }
+};
+
+OCL_TEST_P(Feature2DSIFT_OCL_Fixture, KeypointsClose)
+{
+    ASSERT_EQ(keypoints.size(), ukeypoints.size());
+    for (size_t i = 0; i < keypoints.size(); ++i)
+    {
+        EXPECT_GE(KeyPoint::overlap(keypoints[i], ukeypoints[i]), 0.92);
+        EXPECT_NEAR(keypoints[i].angle, ukeypoints[i].angle, 0.08);
+    }
+}
+
+OCL_TEST_P(Feature2DSIFT_OCL_Fixture, DescriptorsClose)
+{
+    EXPECT_MAT_NEAR(descriptors, udescriptors, 5.0);
+}
+
+OCL_INSTANTIATE_TEST_CASE_P(SIFT, Feature2DSIFT_OCL_Fixture, TEST_IMAGES);
+
 }//ocl
 }//cvtest
 
