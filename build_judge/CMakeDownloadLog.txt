@@ -1,0 +1,3 @@
+#use_cache "/home/spoluri/opencv/.cache"
+#match_hash_in_cmake_cache "OCV_DOWNLOAD_IPPICV_HASH_3rdparty_ippicv_ippicv_2022_3_0_lnx_intel64_20250919_general_tgz"
+#match_hash_in_cmake_cache "OCV_DOWNLOAD_ADE_HASH_3rdparty_ade_v0_1_2e_zip"
