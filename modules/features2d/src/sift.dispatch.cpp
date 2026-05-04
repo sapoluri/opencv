@@ -627,12 +627,12 @@ static bool siftOclCollectCandidates(
     }
 
     bool ok = ker.args(
-        ocl::KernelArg::ReadOnlyNoSize(prev), prev_step,
-        ocl::KernelArg::ReadOnlyNoSize(cur), cur_step,
-        ocl::KernelArg::ReadOnlyNoSize(next), next_step,
+        ocl::KernelArg::PtrReadOnly(prev), prev_step,
+        ocl::KernelArg::PtrReadOnly(cur), cur_step,
+        ocl::KernelArg::PtrReadOnly(next), next_step,
         rows, cols,
         threshold,
-        ocl::KernelArg::ReadWrite(uCounter),
+        ocl::KernelArg::PtrReadWrite(uCounter),
         ocl::KernelArg::PtrWriteOnly(uOutRc),
         kSiftOclMaxCandidates
     ).run(2, globalsize, (localsize[0] && (globalsize[0] >= localsize[0]) && (globalsize[1] >= localsize[1])) ? localsize : 0, true);
@@ -736,9 +736,17 @@ static bool siftOclFindScaleSpaceExtrema(
             const UMat& uCur = udog_pyr[(size_t)idx];
             const UMat& uNext = udog_pyr[(size_t)(idx + 1)];
 
+            UMat uPrevDev, uCurDev, uNextDev;
+            uPrevDev.create(uPrev.size(), uPrev.type(), USAGE_ALLOCATE_DEVICE_MEMORY);
+            uCurDev.create(uCur.size(), uCur.type(), USAGE_ALLOCATE_DEVICE_MEMORY);
+            uNextDev.create(uNext.size(), uNext.type(), USAGE_ALLOCATE_DEVICE_MEMORY);
+            uPrev.copyTo(uPrevDev);
+            uCur.copyTo(uCurDev);
+            uNext.copyTo(uNextDev);
+
             UMat uCounter, uOutRc(kSiftOclMaxCandidates, 2, CV_32S);
             int nCand = 0;
-            if( !siftOclCollectCandidates(uPrev, uCur, uNext, (float)threshold, uCounter, uOutRc, nCand) )
+            if( !siftOclCollectCandidates(uPrevDev, uCurDev, uNextDev, (float)threshold, uCounter, uOutRc, nCand) )
                 return false;
 
             if( nCand > 0 )
