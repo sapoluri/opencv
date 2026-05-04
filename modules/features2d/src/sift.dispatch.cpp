@@ -725,34 +725,20 @@ private:
     TLSData<std::vector<SiftOclProvisionalKeypoint> >* tls;
 };
 
-static bool siftOclAssignOrientationsForImage(
+static bool siftOclAssignOrientationsForImageDevice(
     const UMat& uimg,
-    const std::vector<SiftOclProvisionalKeypoint>& provisional,
+    const UMat& uRc,
+    const UMat& uKpt,
+    const UMat& uOct,
+    int n,
     SiftOclImageOrientedKeypoints& out )
 {
-    if( provisional.empty() )
+    if( n <= 0 )
     {
         out.count = 0;
         return true;
     }
 
-    const int n = (int)provisional.size();
-    Mat hRc(n, 1, CV_32SC2);
-    Mat hKpt(n, 1, CV_32FC4);
-    Mat hOct(n, 1, CV_32S);
-
-    for( int i = 0; i < n; ++i )
-    {
-        hRc.at<Vec2i>(i) = Vec2i(provisional[i].r, provisional[i].c);
-        hKpt.at<Vec4f>(i) = Vec4f(provisional[i].kpt.pt.x, provisional[i].kpt.pt.y,
-                                  provisional[i].kpt.size, provisional[i].kpt.response);
-        hOct.at<int>(i) = provisional[i].kpt.octave;
-    }
-
-    UMat uRc, uKpt, uOct;
-    hRc.copyTo(uRc);
-    hKpt.copyTo(uKpt);
-    hOct.copyTo(uOct);
     const int maxout = std::max(1, n * kSiftOclOrientationDupFactor);
     UMat uCounter(1, 1, CV_32S, USAGE_ALLOCATE_DEVICE_MEMORY);
     UMat uOutKpt(maxout, 1, CV_32FC4, USAGE_ALLOCATE_DEVICE_MEMORY);
@@ -1026,12 +1012,51 @@ static bool siftOclFindScaleSpaceExtrema(
         orientedGroups->assign(grouped.size(), SiftOclImageOrientedKeypoints());
 
     keypoints.clear();
+    int totalProvisional = 0;
+    for( size_t imageIdx = 0; imageIdx < grouped.size(); ++imageIdx )
+        totalProvisional += (int)grouped[imageIdx].size();
+
+    Mat hRc(totalProvisional, 1, CV_32SC2);
+    Mat hKpt(totalProvisional, 1, CV_32FC4);
+    Mat hOct(totalProvisional, 1, CV_32S);
+    std::vector<int> imageOffsets(grouped.size() + 1, 0);
+
+    int offset = 0;
     for( size_t imageIdx = 0; imageIdx < grouped.size(); ++imageIdx )
     {
-        if( grouped[imageIdx].empty() )
+        imageOffsets[imageIdx] = offset;
+        const std::vector<SiftOclProvisionalKeypoint>& local = grouped[imageIdx];
+        for( size_t i = 0; i < local.size(); ++i, ++offset )
+        {
+            hRc.at<Vec2i>(offset) = Vec2i(local[i].r, local[i].c);
+            hKpt.at<Vec4f>(offset) = Vec4f(local[i].kpt.pt.x, local[i].kpt.pt.y,
+                                           local[i].kpt.size, local[i].kpt.response);
+            hOct.at<int>(offset) = local[i].kpt.octave;
+        }
+    }
+    imageOffsets[grouped.size()] = offset;
+
+    UMat uAllRc, uAllKpt, uAllOct;
+    if( totalProvisional > 0 )
+    {
+        hRc.copyTo(uAllRc);
+        hKpt.copyTo(uAllKpt);
+        hOct.copyTo(uAllOct);
+    }
+
+    for( size_t imageIdx = 0; imageIdx < grouped.size(); ++imageIdx )
+    {
+        const int begin = imageOffsets[imageIdx];
+        const int end = imageOffsets[imageIdx + 1];
+        const int count = end - begin;
+        if( count <= 0 )
             continue;
+
+        UMat uRc = uAllRc.rowRange(begin, end);
+        UMat uKpt = uAllKpt.rowRange(begin, end);
+        UMat uOct = uAllOct.rowRange(begin, end);
         SiftOclImageOrientedKeypoints oriented;
-        if( !siftOclAssignOrientationsForImage(ugauss_pyr[imageIdx], grouped[imageIdx], oriented) )
+        if( !siftOclAssignOrientationsForImageDevice(ugauss_pyr[imageIdx], uRc, uKpt, uOct, count, oriented) )
             return false;
         if( orientedGroups )
             (*orientedGroups)[imageIdx] = oriented;
