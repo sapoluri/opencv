@@ -737,7 +737,6 @@ static bool siftOclAssignOrientationsForImage(
     }
 
     const int n = (int)provisional.size();
-    const int maxout = std::max(1, n * kSiftOclOrientationDupFactor);
     Mat hRc(n, 1, CV_32SC2);
     Mat hKpt(n, 1, CV_32FC4);
     Mat hOct(n, 1, CV_32S);
@@ -754,7 +753,7 @@ static bool siftOclAssignOrientationsForImage(
     hRc.copyTo(uRc);
     hKpt.copyTo(uKpt);
     hOct.copyTo(uOct);
-
+    const int maxout = std::max(1, n * kSiftOclOrientationDupFactor);
     UMat uCounter(1, 1, CV_32S, USAGE_ALLOCATE_DEVICE_MEMORY);
     UMat uOutKpt(maxout, 1, CV_32FC4, USAGE_ALLOCATE_DEVICE_MEMORY);
     UMat uOutResp(maxout, 1, CV_32F, USAGE_ALLOCATE_DEVICE_MEMORY);
@@ -847,7 +846,16 @@ static bool siftOclCalcDescriptors(
     if( keypoints.empty() )
         return true;
 
+    struct SiftOclDescriptorEntry
+    {
+        int imageIdx;
+        int originalIdx;
+        Vec4f packed;
+    };
+
     std::vector<std::vector<int> > groups(ugpyr.size());
+    std::vector<SiftOclDescriptorEntry> ordered;
+    ordered.reserve(keypoints.size());
     for( int i = 0; i < (int)keypoints.size(); ++i )
     {
         int octave, layer;
@@ -859,7 +867,20 @@ static bool siftOclCalcDescriptors(
         if( imageIdx < 0 || imageIdx >= (int)ugpyr.size() )
             return false;
         groups[(size_t)imageIdx].push_back(i);
+
+        const KeyPoint& kpt = keypoints[i];
+        SiftOclDescriptorEntry entry;
+        entry.imageIdx = imageIdx;
+        entry.originalIdx = i;
+        entry.packed = Vec4f(kpt.pt.x * scale, kpt.pt.y * scale, kpt.size * scale, kpt.angle);
+        ordered.push_back(entry);
     }
+
+    std::stable_sort(ordered.begin(), ordered.end(),
+        [](const SiftOclDescriptorEntry& a, const SiftOclDescriptorEntry& b)
+        {
+            return a.imageIdx < b.imageIdx;
+        });
 
     ocl::Kernel ker("SIFT_computeDescriptors", ocl::features2d::sift_oclsrc);
     if( ker.empty() )
@@ -870,29 +891,25 @@ static bool siftOclCalcDescriptors(
     if( dev.isIntel() && (dev.type() & ocl::Device::TYPE_GPU) )
         localsize[0] = 64;
 
+    Mat hAllKpt((int)ordered.size(), 1, CV_32FC4);
+    for( int i = 0; i < hAllKpt.rows; ++i )
+        hAllKpt.at<Vec4f>(i) = ordered[(size_t)i].packed;
+
+    UMat uAllKpt, uAllDesc((int)ordered.size(), descriptors.cols, CV_32F, USAGE_ALLOCATE_DEVICE_MEMORY);
+    hAllKpt.copyTo(uAllKpt);
+
+    int offset = 0;
     for( size_t imageIdx = 0; imageIdx < groups.size(); ++imageIdx )
     {
         const std::vector<int>& group = groups[imageIdx];
         if( group.empty() )
             continue;
 
-        Mat hKpt((int)group.size(), 1, CV_32FC4);
-        for( int local = 0; local < (int)group.size(); ++local )
-        {
-            const KeyPoint& kpt = keypoints[group[local]];
-            int octave, layer;
-            float scale;
-            unpackOctave(kpt, octave, layer, scale);
-            float size = kpt.size * scale;
-            Point2f ptf(kpt.pt.x * scale, kpt.pt.y * scale);
-            hKpt.at<Vec4f>(local) = Vec4f(ptf.x, ptf.y, size, kpt.angle);
-        }
-
-        UMat uKpt, uDesc((int)group.size(), descriptors.cols, CV_32F, USAGE_ALLOCATE_DEVICE_MEMORY);
-        hKpt.copyTo(uKpt);
         size_t globalsize[1] = { group.size() };
         if( localsize[0] )
             globalsize[0] = ((globalsize[0] + localsize[0] - 1) / localsize[0]) * localsize[0];
+        UMat uKpt = uAllKpt.rowRange(offset, offset + (int)group.size());
+        UMat uDesc = uAllDesc.rowRange(offset, offset + (int)group.size());
         bool ok = ker.args(
             ocl::KernelArg::PtrReadOnly(ugpyr[imageIdx]), (int)ugpyr[imageIdx].step,
             ugpyr[imageIdx].rows, ugpyr[imageIdx].cols,
@@ -902,11 +919,16 @@ static bool siftOclCalcDescriptors(
         if( !ok )
             return false;
 
-        Mat hDesc;
-        uDesc.copyTo(hDesc);
-        for( int local = 0; local < (int)group.size(); ++local )
-            hDesc.row(local).copyTo(descriptors.row(group[local]));
+        offset += (int)group.size();
     }
+
+    CV_Assert(offset == (int)ordered.size());
+
+    Mat hAllDesc;
+    uAllDesc.copyTo(hAllDesc);
+    for( int i = 0; i < hAllDesc.rows; ++i )
+        hAllDesc.row(i).copyTo(descriptors.row(ordered[(size_t)i].originalIdx));
+
     return true;
 }
 
