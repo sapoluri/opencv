@@ -481,6 +481,25 @@ static void calcDescriptors(const std::vector<Mat>& gpyr, const std::vector<KeyP
 namespace {
 
 static const int kSiftOclMaxCandidates = 1 << 20;
+static const int kSiftOclOrientationDupFactor = 4;
+
+struct SiftOclProvisionalKeypoint
+{
+    int imageIdx;
+    int r;
+    int c;
+    KeyPoint kpt;
+};
+
+struct SiftOclImageOrientedKeypoints
+{
+    UMat keypoints;
+    UMat responses;
+    UMat octaves;
+    int count;
+
+    SiftOclImageOrientedKeypoints() : count(0) {}
+};
 
 static UMat siftCreateInitialImageUMat( const UMat& img, bool doubleImageSize, float sigma, bool enable_precise_upscale )
 {
@@ -666,26 +685,22 @@ static bool siftOclCollectCandidates(
     return true;
 }
 
-class siftProcessCandidatesBody : public ParallelLoopBody
+class siftRefineCandidatesBody : public ParallelLoopBody
 {
 public:
-    siftProcessCandidatesBody(
+        siftRefineCandidatesBody(
         int _o, int _i, int _nOctaveLayers,
-        double _contrastThreshold, double _edgeThreshold, double _sigma,
-        const std::vector<Mat>* _gauss_pyr,
+                double _contrastThreshold, double _edgeThreshold, double _sigma,
         const std::vector<Mat>* _dog_pyr,
         const int* _rc,
-        int _n,
-        TLSData<std::vector<KeyPoint> >* _tls)
+                TLSData<std::vector<SiftOclProvisionalKeypoint> >* _tls)
         : o(_o), i(_i), nOctaveLayers(_nOctaveLayers),
           contrastThreshold(_contrastThreshold), edgeThreshold(_edgeThreshold), sigma(_sigma),
-          gauss_pyr(_gauss_pyr), dog_pyr(_dog_pyr), rc(_rc), n(_n), tls(_tls) {}
+                    dog_pyr(_dog_pyr), rc(_rc), tls(_tls) {}
 
     void operator()( const cv::Range& range ) const CV_OVERRIDE
     {
-        std::vector<KeyPoint>& kpts = tls->getRef();
-        static const int nOri = sift_detail::SIFT_ORI_HIST_BINS;
-        float hist[nOri];
+                std::vector<SiftOclProvisionalKeypoint>& out = tls->getRef();
         for( int k = range.start; k < range.end; k++ )
         {
             int r1 = rc[k * 2], c1 = rc[k * 2 + 1];
@@ -694,45 +709,213 @@ public:
             if( !sift_detail::adjustLocalExtrema(*dog_pyr, kpt, o, layer, r1, c1,
                     nOctaveLayers, (float)contrastThreshold, (float)edgeThreshold, (float)sigma) )
                 continue;
-            float scl_octv = kpt.size*0.5f/(1 << o);
-            float omax = sift_detail::calcOrientationHist((*gauss_pyr)[o*(nOctaveLayers+3) + layer],
-                    Point(c1, r1),
-                    cvRound(sift_detail::SIFT_ORI_RADIUS * scl_octv),
-                    sift_detail::SIFT_ORI_SIG_FCTR * scl_octv,
-                    hist, nOri);
-            float mag_thr = (float)(omax * sift_detail::SIFT_ORI_PEAK_RATIO);
-            for( int j = 0; j < nOri; j++ )
-            {
-                int l = j > 0 ? j - 1 : nOri - 1;
-                int r2 = j < nOri-1 ? j + 1 : 0;
-                if( hist[j] > hist[l]  &&  hist[j] > hist[r2]  &&  hist[j] >= mag_thr )
-                {
-                    float bin = j + 0.5f * (hist[l]-hist[r2]) / (hist[l] - 2*hist[j] + hist[r2]);
-                    bin = bin < 0 ? nOri + bin : bin >= nOri ? bin - nOri : bin;
-                    kpt.angle = 360.f - (float)((360.f/nOri) * bin);
-                    if(std::abs(kpt.angle - 360.f) < FLT_EPSILON)
-                        kpt.angle = 0.f;
-                    kpts.push_back(kpt);
-                }
-            }
+            SiftOclProvisionalKeypoint provisional;
+            provisional.imageIdx = o * (nOctaveLayers + 3) + layer;
+            provisional.r = r1;
+            provisional.c = c1;
+            provisional.kpt = kpt;
+            out.push_back(provisional);
         }
     }
 private:
     int o, i, nOctaveLayers;
     double contrastThreshold, edgeThreshold, sigma;
-    const std::vector<Mat>* gauss_pyr;
     const std::vector<Mat>* dog_pyr;
     const int* rc;
-    int n;
-    TLSData<std::vector<KeyPoint> >* tls;
+    TLSData<std::vector<SiftOclProvisionalKeypoint> >* tls;
 };
+
+static bool siftOclAssignOrientationsForImage(
+    const UMat& uimg,
+    const std::vector<SiftOclProvisionalKeypoint>& provisional,
+    SiftOclImageOrientedKeypoints& out )
+{
+    if( provisional.empty() )
+    {
+        out.count = 0;
+        return true;
+    }
+
+    const int n = (int)provisional.size();
+    const int maxout = std::max(1, n * kSiftOclOrientationDupFactor);
+    Mat hRc(n, 1, CV_32SC2);
+    Mat hKpt(n, 1, CV_32FC4);
+    Mat hOct(n, 1, CV_32S);
+
+    for( int i = 0; i < n; ++i )
+    {
+        hRc.at<Vec2i>(i) = Vec2i(provisional[i].r, provisional[i].c);
+        hKpt.at<Vec4f>(i) = Vec4f(provisional[i].kpt.pt.x, provisional[i].kpt.pt.y,
+                                  provisional[i].kpt.size, provisional[i].kpt.response);
+        hOct.at<int>(i) = provisional[i].kpt.octave;
+    }
+
+    UMat uRc, uKpt, uOct;
+    hRc.copyTo(uRc);
+    hKpt.copyTo(uKpt);
+    hOct.copyTo(uOct);
+
+    UMat uCounter(1, 1, CV_32S, USAGE_ALLOCATE_DEVICE_MEMORY);
+    UMat uOutKpt(maxout, 1, CV_32FC4, USAGE_ALLOCATE_DEVICE_MEMORY);
+    UMat uOutResp(maxout, 1, CV_32F, USAGE_ALLOCATE_DEVICE_MEMORY);
+    UMat uOutOct(maxout, 1, CV_32S, USAGE_ALLOCATE_DEVICE_MEMORY);
+    uCounter.setTo(Scalar(0));
+
+    ocl::Kernel ker("SIFT_assignOrientations", ocl::features2d::sift_oclsrc);
+    if( ker.empty() )
+        return false;
+
+    size_t globalsize[1] = { (size_t)n };
+    size_t localsize[1] = { 0 };
+    const ocl::Device& dev = ocl::Device::getDefault();
+    if( dev.isIntel() && (dev.type() & ocl::Device::TYPE_GPU) )
+        localsize[0] = 64;
+    bool ok = ker.args(
+        ocl::KernelArg::PtrReadOnly(uimg), (int)uimg.step,
+        uimg.rows, uimg.cols,
+        ocl::KernelArg::PtrReadOnly(uRc),
+        ocl::KernelArg::PtrReadOnly(uKpt),
+        ocl::KernelArg::PtrReadOnly(uOct),
+        n,
+        ocl::KernelArg::PtrReadWrite(uCounter),
+        ocl::KernelArg::PtrWriteOnly(uOutKpt),
+        ocl::KernelArg::PtrWriteOnly(uOutResp),
+        ocl::KernelArg::PtrWriteOnly(uOutOct),
+        maxout
+    ).run(1, globalsize, localsize[0] ? localsize : NULL, true);
+    if( !ok )
+        return false;
+
+    Mat hCount;
+    uCounter.copyTo(hCount);
+    int outCount = hCount.at<int>(0);
+    out.count = outCount;
+    if( outCount <= 0 )
+        return true;
+    if( outCount > maxout )
+        return false;
+
+    if( outCount < maxout )
+    {
+        out.keypoints = uOutKpt.rowRange(0, outCount);
+        out.responses = uOutResp.rowRange(0, outCount);
+        out.octaves = uOutOct.rowRange(0, outCount);
+    }
+    else
+    {
+        out.keypoints = uOutKpt;
+        out.responses = uOutResp;
+        out.octaves = uOutOct;
+    }
+
+    return true;
+}
+
+static void siftOclDownloadKeypoints(
+    const SiftOclImageOrientedKeypoints& oriented,
+    std::vector<KeyPoint>& keypoints )
+{
+    if( oriented.count <= 0 )
+        return;
+
+    Mat hKpt, hOct;
+    Mat hResp;
+    oriented.keypoints.copyTo(hKpt);
+    oriented.responses.copyTo(hResp);
+    oriented.octaves.copyTo(hOct);
+    keypoints.reserve(keypoints.size() + (size_t)oriented.count);
+    for( int i = 0; i < oriented.count; ++i )
+    {
+        const Vec4f v = hKpt.at<Vec4f>(i);
+        KeyPoint kpt;
+        kpt.pt = Point2f(v[0], v[1]);
+        kpt.size = v[2];
+        kpt.angle = v[3];
+        kpt.response = hResp.at<float>(i);
+        kpt.octave = hOct.at<int>(i);
+        keypoints.push_back(kpt);
+    }
+}
+
+static bool siftOclCalcDescriptors(
+    const std::vector<UMat>& ugpyr,
+    const std::vector<KeyPoint>& keypoints,
+    Mat& descriptors,
+    int nOctaveLayers,
+    int firstOctave )
+{
+    if( keypoints.empty() )
+        return true;
+
+    std::vector<std::vector<int> > groups(ugpyr.size());
+    for( int i = 0; i < (int)keypoints.size(); ++i )
+    {
+        int octave, layer;
+        float scale;
+        unpackOctave(keypoints[i], octave, layer, scale);
+        if( octave < firstOctave || layer > nOctaveLayers + 2 )
+            return false;
+        int imageIdx = (octave - firstOctave) * (nOctaveLayers + 3) + layer;
+        if( imageIdx < 0 || imageIdx >= (int)ugpyr.size() )
+            return false;
+        groups[(size_t)imageIdx].push_back(i);
+    }
+
+    ocl::Kernel ker("SIFT_computeDescriptors", ocl::features2d::sift_oclsrc);
+    if( ker.empty() )
+        return false;
+
+    size_t localsize[1] = { 0 };
+    const ocl::Device& dev = ocl::Device::getDefault();
+    if( dev.isIntel() && (dev.type() & ocl::Device::TYPE_GPU) )
+        localsize[0] = 64;
+
+    for( size_t imageIdx = 0; imageIdx < groups.size(); ++imageIdx )
+    {
+        const std::vector<int>& group = groups[imageIdx];
+        if( group.empty() )
+            continue;
+
+        Mat hKpt((int)group.size(), 1, CV_32FC4);
+        for( int local = 0; local < (int)group.size(); ++local )
+        {
+            const KeyPoint& kpt = keypoints[group[local]];
+            int octave, layer;
+            float scale;
+            unpackOctave(kpt, octave, layer, scale);
+            float size = kpt.size * scale;
+            Point2f ptf(kpt.pt.x * scale, kpt.pt.y * scale);
+            hKpt.at<Vec4f>(local) = Vec4f(ptf.x, ptf.y, size, kpt.angle);
+        }
+
+        UMat uKpt, uDesc((int)group.size(), descriptors.cols, CV_32F, USAGE_ALLOCATE_DEVICE_MEMORY);
+        hKpt.copyTo(uKpt);
+        size_t globalsize[1] = { group.size() };
+        if( localsize[0] )
+            globalsize[0] = ((globalsize[0] + localsize[0] - 1) / localsize[0]) * localsize[0];
+        bool ok = ker.args(
+            ocl::KernelArg::PtrReadOnly(ugpyr[imageIdx]), (int)ugpyr[imageIdx].step,
+            ugpyr[imageIdx].rows, ugpyr[imageIdx].cols,
+            ocl::KernelArg::PtrReadOnly(uKpt), (int)group.size(),
+            ocl::KernelArg::PtrWriteOnly(uDesc), (int)uDesc.step
+        ).run(1, globalsize, localsize[0] ? localsize : NULL, true);
+        if( !ok )
+            return false;
+
+        Mat hDesc;
+        uDesc.copyTo(hDesc);
+        for( int local = 0; local < (int)group.size(); ++local )
+            hDesc.row(local).copyTo(descriptors.row(group[local]));
+    }
+    return true;
+}
 
 static bool siftOclFindScaleSpaceExtrema(
     SIFT_Impl* impl,
-    const std::vector<Mat>& gauss_pyr,
-    const std::vector<Mat>& dog_pyr,
+    const std::vector<UMat>& ugauss_pyr,
     const std::vector<UMat>& udog_pyr,
-    std::vector<KeyPoint>& keypoints )
+    std::vector<KeyPoint>& keypoints,
+    std::vector<SiftOclImageOrientedKeypoints>* orientedGroups )
 {
     const int nOctaveLayers = impl->getNOctaveLayers();
     const double contrastThreshold = impl->getContrastThreshold();
@@ -740,14 +923,17 @@ static bool siftOclFindScaleSpaceExtrema(
     const double sigma = impl->getSigma();
     const int threshold = cvFloor(0.5 * contrastThreshold / nOctaveLayers * 255 * sift_detail::SIFT_FIXPT_SCALE);
 
-    const int nOctaves = (int)gauss_pyr.size()/(nOctaveLayers + 3);
-    TLSDataAccumulator<std::vector<KeyPoint> > tls_kpts_struct;
+    const int nOctaves = (int)ugauss_pyr.size()/(nOctaveLayers + 3);
+    TLSDataAccumulator<std::vector<SiftOclProvisionalKeypoint> > tls_refined_struct;
     UMat uCounter(1, 1, CV_32S, USAGE_ALLOCATE_DEVICE_MEMORY);
     UMat uOutRc(kSiftOclMaxCandidates, 2, CV_32S, USAGE_ALLOCATE_DEVICE_MEMORY);
     UMat uPrevDev, uCurDev, uNextDev;
     ocl::Kernel ker("SIFT_collectExtremaCandidates", ocl::features2d::sift_oclsrc);
     if( ker.empty() )
         return false;
+
+    std::vector<std::vector<int> > rcLists((size_t)nOctaves * (size_t)nOctaveLayers);
+    std::vector<int> rcCounts((size_t)nOctaves * (size_t)nOctaveLayers, 0);
 
     for( int o = 0; o < nOctaves; o++ )
     {
@@ -767,11 +953,9 @@ static bool siftOclFindScaleSpaceExtrema(
             {
                 Mat rcHost;
                 uOutRc.rowRange(0, nCand).copyTo(rcHost);
-                const int* rc = rcHost.ptr<int>();
-
-                parallel_for_(Range(0, nCand), siftProcessCandidatesBody(
-                    o, i, nOctaveLayers, contrastThreshold, edgeThreshold, sigma,
-                    &gauss_pyr, &dog_pyr, rc, nCand, &tls_kpts_struct));
+                const int listIdx = o * nOctaveLayers + (i - 1);
+                rcLists[(size_t)listIdx].assign(rcHost.ptr<int>(), rcHost.ptr<int>() + nCand * 2);
+                rcCounts[(size_t)listIdx] = nCand;
             }
 
             if( i < nOctaveLayers )
@@ -783,10 +967,64 @@ static bool siftOclFindScaleSpaceExtrema(
         }
     }
 
-    std::vector<std::vector<KeyPoint>*> kpt_vecs;
-    tls_kpts_struct.gather(kpt_vecs);
-    for (size_t i = 0; i < kpt_vecs.size(); ++i) {
-        keypoints.insert(keypoints.end(), kpt_vecs[i]->begin(), kpt_vecs[i]->end());
+    std::vector<Mat> dog_pyr_view;
+    siftUMatPyrToMatView(udog_pyr, dog_pyr_view);
+
+    for( int o = 0; o < nOctaves; ++o )
+    {
+        for( int i = 1; i <= nOctaveLayers; ++i )
+        {
+            const int listIdx = o * nOctaveLayers + (i - 1);
+            const int nCand = rcCounts[(size_t)listIdx];
+            if( nCand <= 0 )
+                continue;
+            const int* rc = rcLists[(size_t)listIdx].data();
+            parallel_for_(Range(0, nCand), siftRefineCandidatesBody(
+                o, i, nOctaveLayers, contrastThreshold, edgeThreshold, sigma,
+                &dog_pyr_view, rc, &tls_refined_struct));
+        }
+    }
+
+    std::vector<std::vector<SiftOclProvisionalKeypoint>*> provisional_vecs;
+    tls_refined_struct.gather(provisional_vecs);
+    std::vector<std::vector<SiftOclProvisionalKeypoint> > grouped(ugauss_pyr.size());
+    for( size_t i = 0; i < provisional_vecs.size(); ++i )
+    {
+        const std::vector<SiftOclProvisionalKeypoint>& vec = *provisional_vecs[i];
+        for( size_t j = 0; j < vec.size(); ++j )
+        {
+            const SiftOclProvisionalKeypoint& provisional = vec[j];
+            if( provisional.imageIdx < 0 || provisional.imageIdx >= (int)grouped.size() )
+                return false;
+            grouped[(size_t)provisional.imageIdx].push_back(provisional);
+        }
+    }
+
+    if( orientedGroups )
+        orientedGroups->assign(grouped.size(), SiftOclImageOrientedKeypoints());
+
+    keypoints.clear();
+    for( size_t imageIdx = 0; imageIdx < grouped.size(); ++imageIdx )
+    {
+        if( grouped[imageIdx].empty() )
+            continue;
+        SiftOclImageOrientedKeypoints oriented;
+        if( !siftOclAssignOrientationsForImage(ugauss_pyr[imageIdx], grouped[imageIdx], oriented) )
+            return false;
+        if( orientedGroups )
+            (*orientedGroups)[imageIdx] = oriented;
+        else
+            siftOclDownloadKeypoints(oriented, keypoints);
+    }
+
+    if( orientedGroups )
+    {
+        for( size_t imageIdx = 0; imageIdx < orientedGroups->size(); ++imageIdx )
+        {
+            std::vector<KeyPoint> groupKeypoints;
+            siftOclDownloadKeypoints((*orientedGroups)[imageIdx], groupKeypoints);
+            keypoints.insert(keypoints.end(), groupKeypoints.begin(), groupKeypoints.end());
+        }
     }
     return true;
 }
@@ -808,10 +1046,17 @@ static bool siftTryOpenCLDetectAndCompute(
     if( impl->descriptorType() != CV_32F )
         return false;
 
+    const bool fullOffload = std::getenv("OPENCV_SIFT_OPENCL_FULL") != NULL;
+
     UMat uimage = _image.getUMat();
     Mat mask = _mask.getMat();
 
     if( uimage.empty() || uimage.depth() != CV_8U )
+        return false;
+
+    // Full OpenCL detect+describe remains experimental. The average end-to-end benchmark
+    // cost is still better with the CPU descriptor path unless this mode is requested.
+    if( _descriptors.needed() && !fullOffload )
         return false;
 
     // Skip OpenCL SIFT on very small inputs: host↔device and kernel launch costs dominate.
@@ -837,22 +1082,19 @@ static bool siftTryOpenCLDetectAndCompute(
     siftBuildGaussianPyramidUMat(ubase, ugpyr, nOctaves, impl->getNOctaveLayers(), impl->getSigma());
 
     std::vector<Mat> gpyr, dogpyr;
-    // gpyr: ugpyr is never touched by OpenCL after the DoG build, so a view is safe.
-    siftUMatPyrToMatView(ugpyr, gpyr);
 
+    bool usedOclExtrema = false;
     if( !useProvidedKeypoints )
     {
         std::vector<UMat> udogpyr;
         siftBuildDoGPyramidUMat(ugpyr, udogpyr, impl->getNOctaveLayers());
-        // dogpyr: udogpyr elements are live in the OpenCL rolling window inside
-        // siftOclFindScaleSpaceExtrema, so we must deep-copy rather than hold a
-        // getMat view (which would lock the host-device mapping and cause a
-        // refcount assertion when udogpyr is destroyed).
-        siftUMatPyrToMat(udogpyr, dogpyr);
 
         keypoints.clear();
-        if( !siftOclFindScaleSpaceExtrema(impl, gpyr, dogpyr, udogpyr, keypoints) )
+        usedOclExtrema = siftOclFindScaleSpaceExtrema(impl, ugpyr, udogpyr, keypoints, NULL);
+        if( !usedOclExtrema )
         {
+            siftUMatPyrToMatView(ugpyr, gpyr);
+            siftUMatPyrToMat(udogpyr, dogpyr);
             keypoints.clear();
             impl->findScaleSpaceExtrema(gpyr, dogpyr, keypoints);
         }
@@ -879,8 +1121,13 @@ static bool siftTryOpenCLDetectAndCompute(
         int dsize = impl->descriptorSize();
         _descriptors.create((int)keypoints.size(), dsize, impl->descriptorType());
         Mat descriptors = _descriptors.getMat();
-        calcDescriptors(gpyr, keypoints, descriptors, impl->getNOctaveLayers(), firstOctave);
+        if( !usedOclExtrema || !siftOclCalcDescriptors(ugpyr, keypoints, descriptors, impl->getNOctaveLayers(), firstOctave) )
+        {
+            siftUMatPyrToMatView(ugpyr, gpyr);
+            calcDescriptors(gpyr, keypoints, descriptors, impl->getNOctaveLayers(), firstOctave);
+        }
     }
+
     return true;
 }
 
