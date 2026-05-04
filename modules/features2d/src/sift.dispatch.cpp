@@ -591,37 +591,53 @@ static void siftBuildDoGPyramidUMat( const std::vector<UMat>& gpyr, std::vector<
     parallel_for_(Range(0, nOctaves * (nOctaveLayers + 2)), siftBuildDoGPyramidUMatComputer(nOctaveLayers, gpyr, dogpyr));
 }
 
+static void siftCopyToDeviceBuffer( const UMat& src, UMat& dst )
+{
+    if( dst.empty() || dst.size() != src.size() || dst.type() != src.type() )
+        dst.create(src.size(), src.type(), USAGE_ALLOCATE_DEVICE_MEMORY);
+    src.copyTo(dst);
+}
+
 static void siftUMatPyrToMat( const std::vector<UMat>& u, std::vector<Mat>& m )
 {
+    // Deep copy: use when u elements will be concurrently accessed by OpenCL operations.
     m.resize(u.size());
     for( size_t i = 0; i < u.size(); i++ )
         u[i].copyTo(m[i]);
 }
 
+static void siftUMatPyrToMatView( const std::vector<UMat>& u, std::vector<Mat>& m )
+{
+    // Zero-copy view: ONLY safe when u elements are NOT used by any concurrent OpenCL op.
+    m.resize(u.size());
+    for( size_t i = 0; i < u.size(); i++ )
+        m[i] = u[i].getMat(ACCESS_READ);
+}
+
 static bool siftOclCollectCandidates(
+    ocl::Kernel& ker,
     const UMat& prev, const UMat& cur, const UMat& next,
     float threshold,
     UMat& uCounter,
     UMat& uOutRc,
     int& outCount )
 {
-    ocl::Kernel ker("SIFT_collectExtremaCandidates", ocl::features2d::sift_oclsrc);
-    if( ker.empty() )
-        return false;
-
-    uCounter.create(1, 1, CV_32S);
     uCounter.setTo(Scalar(0));
 
     int rows = cur.rows, cols = cur.cols;
     int prev_step = (int)prev.step, cur_step = (int)cur.step, next_step = (int)next.step;
 
-    size_t globalsize[] = { (size_t)std::max(1, cols - 2 * sift_detail::SIFT_IMG_BORDER),
-                            (size_t)std::max(1, rows - 2 * sift_detail::SIFT_IMG_BORDER) };
-    ocl::Device dev = ocl::Device::getDefault();
-    size_t localsize[2] = { 0, 0 };
-    if( dev.isIntel() && (dev.type() & ocl::Device::TYPE_GPU) &&
-        (globalsize[0] % 8u == 0u) && (globalsize[1] % 8u == 0u) )
+    // Always use 8×8 work groups on Intel GPU; pad global size to multiples of 8.
+    // The kernel has an out-of-bounds guard so extra work items exit immediately.
+    size_t gw = (size_t)std::max(1, cols - 2 * sift_detail::SIFT_IMG_BORDER);
+    size_t gh = (size_t)std::max(1, rows - 2 * sift_detail::SIFT_IMG_BORDER);
+    size_t globalsize[2], localsize[2] = { 0, 0 };
+    globalsize[0] = gw; globalsize[1] = gh;
+    const ocl::Device& dev = ocl::Device::getDefault();
+    if( dev.isIntel() && (dev.type() & ocl::Device::TYPE_GPU) )
     {
+        globalsize[0] = (gw + 7u) & ~7u;
+        globalsize[1] = (gh + 7u) & ~7u;
         localsize[0] = 8;
         localsize[1] = 8;
     }
@@ -635,7 +651,7 @@ static bool siftOclCollectCandidates(
         ocl::KernelArg::PtrReadWrite(uCounter),
         ocl::KernelArg::PtrWriteOnly(uOutRc),
         kSiftOclMaxCandidates
-    ).run(2, globalsize, (localsize[0] && (globalsize[0] >= localsize[0]) && (globalsize[1] >= localsize[1])) ? localsize : 0, true);
+    ).run(2, globalsize, localsize[0] ? localsize : nullptr, true);
 
     if( !ok )
         return false;
@@ -726,27 +742,25 @@ static bool siftOclFindScaleSpaceExtrema(
 
     const int nOctaves = (int)gauss_pyr.size()/(nOctaveLayers + 3);
     TLSDataAccumulator<std::vector<KeyPoint> > tls_kpts_struct;
+    UMat uCounter(1, 1, CV_32S, USAGE_ALLOCATE_DEVICE_MEMORY);
+    UMat uOutRc(kSiftOclMaxCandidates, 2, CV_32S, USAGE_ALLOCATE_DEVICE_MEMORY);
+    UMat uPrevDev, uCurDev, uNextDev;
+    ocl::Kernel ker("SIFT_collectExtremaCandidates", ocl::features2d::sift_oclsrc);
+    if( ker.empty() )
+        return false;
 
     for( int o = 0; o < nOctaves; o++ )
     {
+        const int octaveBase = o * (nOctaveLayers + 2);
+        siftCopyToDeviceBuffer(udog_pyr[(size_t)octaveBase], uPrevDev);
+        siftCopyToDeviceBuffer(udog_pyr[(size_t)(octaveBase + 1)], uCurDev);
+        siftCopyToDeviceBuffer(udog_pyr[(size_t)(octaveBase + 2)], uNextDev);
+
         for( int i = 1; i <= nOctaveLayers; i++ )
         {
             const int idx = o*(nOctaveLayers+2)+i;
-            const UMat& uPrev = udog_pyr[(size_t)(idx - 1)];
-            const UMat& uCur = udog_pyr[(size_t)idx];
-            const UMat& uNext = udog_pyr[(size_t)(idx + 1)];
-
-            UMat uPrevDev, uCurDev, uNextDev;
-            uPrevDev.create(uPrev.size(), uPrev.type(), USAGE_ALLOCATE_DEVICE_MEMORY);
-            uCurDev.create(uCur.size(), uCur.type(), USAGE_ALLOCATE_DEVICE_MEMORY);
-            uNextDev.create(uNext.size(), uNext.type(), USAGE_ALLOCATE_DEVICE_MEMORY);
-            uPrev.copyTo(uPrevDev);
-            uCur.copyTo(uCurDev);
-            uNext.copyTo(uNextDev);
-
-            UMat uCounter, uOutRc(kSiftOclMaxCandidates, 2, CV_32S);
             int nCand = 0;
-            if( !siftOclCollectCandidates(uPrevDev, uCurDev, uNextDev, (float)threshold, uCounter, uOutRc, nCand) )
+            if( !siftOclCollectCandidates(ker, uPrevDev, uCurDev, uNextDev, (float)threshold, uCounter, uOutRc, nCand) )
                 return false;
 
             if( nCand > 0 )
@@ -758,6 +772,13 @@ static bool siftOclFindScaleSpaceExtrema(
                 parallel_for_(Range(0, nCand), siftProcessCandidatesBody(
                     o, i, nOctaveLayers, contrastThreshold, edgeThreshold, sigma,
                     &gauss_pyr, &dog_pyr, rc, nCand, &tls_kpts_struct));
+            }
+
+            if( i < nOctaveLayers )
+            {
+                std::swap(uPrevDev, uCurDev);
+                std::swap(uCurDev, uNextDev);
+                siftCopyToDeviceBuffer(udog_pyr[(size_t)(idx + 2)], uNextDev);
             }
         }
     }
@@ -816,12 +837,17 @@ static bool siftTryOpenCLDetectAndCompute(
     siftBuildGaussianPyramidUMat(ubase, ugpyr, nOctaves, impl->getNOctaveLayers(), impl->getSigma());
 
     std::vector<Mat> gpyr, dogpyr;
-    siftUMatPyrToMat(ugpyr, gpyr);
+    // gpyr: ugpyr is never touched by OpenCL after the DoG build, so a view is safe.
+    siftUMatPyrToMatView(ugpyr, gpyr);
 
     if( !useProvidedKeypoints )
     {
         std::vector<UMat> udogpyr;
         siftBuildDoGPyramidUMat(ugpyr, udogpyr, impl->getNOctaveLayers());
+        // dogpyr: udogpyr elements are live in the OpenCL rolling window inside
+        // siftOclFindScaleSpaceExtrema, so we must deep-copy rather than hold a
+        // getMat view (which would lock the host-device mapping and cause a
+        // refcount assertion when udogpyr is destroyed).
         siftUMatPyrToMat(udogpyr, dogpyr);
 
         keypoints.clear();

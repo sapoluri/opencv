@@ -13,13 +13,13 @@ inline float read_dog(__global const uchar* base, int step_bytes, int r, int c)
 
 // First-pass DoG extrema test (matches scalar path in sift.simd.hpp).
 __kernel void SIFT_collectExtremaCandidates(
-    __global const uchar* prev_base, int prev_step,
-    __global const uchar* cur_base, int cur_step,
-    __global const uchar* next_base, int next_step,
+    __global const uchar* restrict prev_base, int prev_step,
+    __global const uchar* restrict cur_base, int cur_step,
+    __global const uchar* restrict next_base, int next_step,
     int rows, int cols,
     float threshold,
     volatile __global int* counter,
-    __global int* out_rc,
+    __global int* restrict out_rc,
     int maxout
 )
 {
