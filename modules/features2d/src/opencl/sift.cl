@@ -128,6 +128,122 @@ __kernel void SIFT_collectExtremaCandidates(
     }
 }
 
+// Stacked variant: reads prev/cur/next layers from a single per-octave DoG stack so the
+// host never copies individual layers into separate device buffers (Opt-B).
+__kernel void SIFT_collectExtremaCandidatesStacked(
+    __global const uchar* restrict dog_base,
+    int dog_step,
+    int layer_rows,
+    int rows,
+    int cols,
+    int prev_l,
+    int cur_l,
+    int next_l,
+    float threshold,
+    volatile __global int* counter,
+    __global int* restrict out_rc,
+    int maxout
+)
+{
+    int c = (int)get_global_id(0) + SIFT_IMG_BORDER;
+    int r = (int)get_global_id(1) + SIFT_IMG_BORDER;
+    if (r >= rows - SIFT_IMG_BORDER || c >= cols - SIFT_IMG_BORDER)
+        return;
+
+    float val = read_dog_layer(dog_base, dog_step, layer_rows, cur_l, r, c);
+    if (fabs(val) <= threshold)
+        return;
+
+    float _00 = read_dog_layer(dog_base, dog_step, layer_rows, cur_l, r - 1, c - 1);
+    float _01 = read_dog_layer(dog_base, dog_step, layer_rows, cur_l, r - 1, c);
+    float _02 = read_dog_layer(dog_base, dog_step, layer_rows, cur_l, r - 1, c + 1);
+    float _10 = read_dog_layer(dog_base, dog_step, layer_rows, cur_l, r, c - 1);
+    float _12 = read_dog_layer(dog_base, dog_step, layer_rows, cur_l, r, c + 1);
+    float _20 = read_dog_layer(dog_base, dog_step, layer_rows, cur_l, r + 1, c - 1);
+    float _21 = read_dog_layer(dog_base, dog_step, layer_rows, cur_l, r + 1, c);
+    float _22 = read_dog_layer(dog_base, dog_step, layer_rows, cur_l, r + 1, c + 1);
+
+    bool calculate = false;
+    if (val > 0.f)
+    {
+        float vmax = fmax(fmax(fmax(_00, _01), fmax(_02, _10)), fmax(fmax(_12, _20), fmax(_21, _22)));
+        if (val >= vmax)
+        {
+            _00 = read_dog_layer(dog_base, dog_step, layer_rows, prev_l, r - 1, c - 1);
+            _01 = read_dog_layer(dog_base, dog_step, layer_rows, prev_l, r - 1, c);
+            _02 = read_dog_layer(dog_base, dog_step, layer_rows, prev_l, r - 1, c + 1);
+            _10 = read_dog_layer(dog_base, dog_step, layer_rows, prev_l, r, c - 1);
+            _12 = read_dog_layer(dog_base, dog_step, layer_rows, prev_l, r, c + 1);
+            _20 = read_dog_layer(dog_base, dog_step, layer_rows, prev_l, r + 1, c - 1);
+            _21 = read_dog_layer(dog_base, dog_step, layer_rows, prev_l, r + 1, c);
+            _22 = read_dog_layer(dog_base, dog_step, layer_rows, prev_l, r + 1, c + 1);
+            vmax = fmax(fmax(fmax(_00, _01), fmax(_02, _10)), fmax(fmax(_12, _20), fmax(_21, _22)));
+            if (val >= vmax)
+            {
+                _00 = read_dog_layer(dog_base, dog_step, layer_rows, next_l, r - 1, c - 1);
+                _01 = read_dog_layer(dog_base, dog_step, layer_rows, next_l, r - 1, c);
+                _02 = read_dog_layer(dog_base, dog_step, layer_rows, next_l, r - 1, c + 1);
+                _10 = read_dog_layer(dog_base, dog_step, layer_rows, next_l, r, c - 1);
+                _12 = read_dog_layer(dog_base, dog_step, layer_rows, next_l, r, c + 1);
+                _20 = read_dog_layer(dog_base, dog_step, layer_rows, next_l, r + 1, c - 1);
+                _21 = read_dog_layer(dog_base, dog_step, layer_rows, next_l, r + 1, c);
+                _22 = read_dog_layer(dog_base, dog_step, layer_rows, next_l, r + 1, c + 1);
+                vmax = fmax(fmax(fmax(_00, _01), fmax(_02, _10)), fmax(fmax(_12, _20), fmax(_21, _22)));
+                if (val >= vmax)
+                {
+                    float _11p = read_dog_layer(dog_base, dog_step, layer_rows, prev_l, r, c);
+                    float _11n = read_dog_layer(dog_base, dog_step, layer_rows, next_l, r, c);
+                    calculate = (val >= fmax(_11p, _11n));
+                }
+            }
+        }
+    }
+    else
+    {
+        float vmin = fmin(fmin(fmin(_00, _01), fmin(_02, _10)), fmin(fmin(_12, _20), fmin(_21, _22)));
+        if (val <= vmin)
+        {
+            _00 = read_dog_layer(dog_base, dog_step, layer_rows, prev_l, r - 1, c - 1);
+            _01 = read_dog_layer(dog_base, dog_step, layer_rows, prev_l, r - 1, c);
+            _02 = read_dog_layer(dog_base, dog_step, layer_rows, prev_l, r - 1, c + 1);
+            _10 = read_dog_layer(dog_base, dog_step, layer_rows, prev_l, r, c - 1);
+            _12 = read_dog_layer(dog_base, dog_step, layer_rows, prev_l, r, c + 1);
+            _20 = read_dog_layer(dog_base, dog_step, layer_rows, prev_l, r + 1, c - 1);
+            _21 = read_dog_layer(dog_base, dog_step, layer_rows, prev_l, r + 1, c);
+            _22 = read_dog_layer(dog_base, dog_step, layer_rows, prev_l, r + 1, c + 1);
+            vmin = fmin(fmin(fmin(_00, _01), fmin(_02, _10)), fmin(fmin(_12, _20), fmin(_21, _22)));
+            if (val <= vmin)
+            {
+                _00 = read_dog_layer(dog_base, dog_step, layer_rows, next_l, r - 1, c - 1);
+                _01 = read_dog_layer(dog_base, dog_step, layer_rows, next_l, r - 1, c);
+                _02 = read_dog_layer(dog_base, dog_step, layer_rows, next_l, r - 1, c + 1);
+                _10 = read_dog_layer(dog_base, dog_step, layer_rows, next_l, r, c - 1);
+                _12 = read_dog_layer(dog_base, dog_step, layer_rows, next_l, r, c + 1);
+                _20 = read_dog_layer(dog_base, dog_step, layer_rows, next_l, r + 1, c - 1);
+                _21 = read_dog_layer(dog_base, dog_step, layer_rows, next_l, r + 1, c);
+                _22 = read_dog_layer(dog_base, dog_step, layer_rows, next_l, r + 1, c + 1);
+                vmin = fmin(fmin(fmin(_00, _01), fmin(_02, _10)), fmin(fmin(_12, _20), fmin(_21, _22)));
+                if (val <= vmin)
+                {
+                    float _11p = read_dog_layer(dog_base, dog_step, layer_rows, prev_l, r, c);
+                    float _11n = read_dog_layer(dog_base, dog_step, layer_rows, next_l, r, c);
+                    calculate = (val <= fmin(_11p, _11n));
+                }
+            }
+        }
+    }
+
+    if (!calculate)
+        return;
+
+    int idx = atomic_inc(counter);
+    if (idx < maxout)
+    {
+        out_rc[idx * 2] = r;
+        out_rc[idx * 2 + 1] = c;
+    }
+}
+
 // Subpixel refinement and edge/contrast rejection (matches sift_detail::adjustLocalExtrema logic).
 __kernel void SIFT_refineExtremaCandidates(
     __global const uchar* restrict dog_base,
@@ -408,7 +524,6 @@ __kernel void SIFT_assignOrientations(
         }
     }
 }
-
 __kernel void SIFT_computeDescriptors(
     __global const uchar* restrict img_base,
     int img_step,

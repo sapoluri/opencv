@@ -481,6 +481,7 @@ static void calcDescriptors(const std::vector<Mat>& gpyr, const std::vector<KeyP
 namespace {
 
 static const int kSiftOclMaxCandidates = 1 << 20;
+static const int kSiftOclMaxCanPerLayer = 1 << 17;  // per-layer cap for batched-async collect (128 K)
 static const int kSiftOclOrientationDupFactor = 4;
 
 struct SiftOclProvisionalKeypoint
@@ -821,7 +822,6 @@ static void siftOclDownloadKeypoints(
         keypoints.push_back(kpt);
     }
 }
-
 static bool siftOclCalcDescriptors(
     const std::vector<UMat>& ugpyr,
     const std::vector<KeyPoint>& keypoints,
@@ -933,8 +933,18 @@ static bool siftOclFindScaleSpaceExtrema(
 
     const int nOctaves = (int)ugauss_pyr.size()/(nOctaveLayers + 3);
     TLSDataAccumulator<std::vector<SiftOclProvisionalKeypoint> > tls_refined_struct;
-    UMat uCounter(1, 1, CV_32S, USAGE_ALLOCATE_DEVICE_MEMORY);
-    UMat uOutRc(kSiftOclMaxCandidates, 2, CV_32S, USAGE_ALLOCATE_DEVICE_MEMORY);
+    // Opt-A: per-layer candidate buffers and a per-octave counter array.
+    // All nOctaveLayers collect kernels are issued without any intermediate counter readback;
+    // a single uCounterOctave.copyTo() per octave flushes the queue and returns all counts.
+    std::vector<UMat> uLayerRcBufs((size_t)nOctaveLayers);
+    for( int j = 0; j < nOctaveLayers; j++ )
+        uLayerRcBufs[(size_t)j].create(kSiftOclMaxCanPerLayer, 2, CV_32S, USAGE_ALLOCATE_DEVICE_MEMORY);
+    UMat uCounterOctave(nOctaveLayers, 1, CV_32S, USAGE_ALLOCATE_DEVICE_MEMORY);
+    // Pre-build stable row-range sub-UMats so they outlive inner-loop scope across async dispatch.
+    std::vector<UMat> uCounterSlices((size_t)nOctaveLayers);
+    for( int j = 0; j < nOctaveLayers; j++ )
+        uCounterSlices[(size_t)j] = uCounterOctave.rowRange(j, j + 1);
+
     UMat uPrevDev, uCurDev, uNextDev;
     ocl::Kernel ker("SIFT_collectExtremaCandidates", ocl::features2d::sift_oclsrc);
     if( ker.empty() )
@@ -946,25 +956,49 @@ static bool siftOclFindScaleSpaceExtrema(
     for( int o = 0; o < nOctaves; o++ )
     {
         const int octaveBase = o * (nOctaveLayers + 2);
-        siftCopyToDeviceBuffer(udog_pyr[(size_t)octaveBase], uPrevDev);
+        siftCopyToDeviceBuffer(udog_pyr[(size_t)octaveBase],       uPrevDev);
         siftCopyToDeviceBuffer(udog_pyr[(size_t)(octaveBase + 1)], uCurDev);
         siftCopyToDeviceBuffer(udog_pyr[(size_t)(octaveBase + 2)], uNextDev);
 
+        // Reset all per-layer counters with one GPU write instead of nOctaveLayers separate resets.
+        uCounterOctave.setTo(Scalar(0));
+
+        // Issue all nOctaveLayers collect kernels for this octave without reading any counter.
+        // The in-order OpenCL queue preserves ordering between kernel dispatches and
+        // the siftCopyToDeviceBuffer calls that feed subsequent layers.
+        const ocl::Device& collectDev = ocl::Device::getDefault();
+        const bool collectIsIntelGPU = collectDev.isIntel() && (collectDev.type() & ocl::Device::TYPE_GPU);
+
         for( int i = 1; i <= nOctaveLayers; i++ )
         {
-            const int idx = o*(nOctaveLayers+2)+i;
-            int nCand = 0;
-            if( !siftOclCollectCandidates(ker, uPrevDev, uCurDev, uNextDev, (float)threshold, uCounter, uOutRc, nCand) )
-                return false;
+            const int idx = o * (nOctaveLayers + 2) + i;
+            const int li  = i - 1;
+            int rows = uCurDev.rows, cols = uCurDev.cols;
+            int prev_step = (int)uPrevDev.step, cur_step = (int)uCurDev.step, next_step = (int)uNextDev.step;
 
-            if( nCand > 0 )
+            size_t gw = (size_t)std::max(1, cols - 2 * sift_detail::SIFT_IMG_BORDER);
+            size_t gh = (size_t)std::max(1, rows - 2 * sift_detail::SIFT_IMG_BORDER);
+            size_t globalsize[2], localsize[2] = { 0, 0 };
+            globalsize[0] = gw; globalsize[1] = gh;
+            if( collectIsIntelGPU )
             {
-                Mat rcHost;
-                uOutRc.rowRange(0, nCand).copyTo(rcHost);
-                const int listIdx = o * nOctaveLayers + (i - 1);
-                rcLists[(size_t)listIdx].assign(rcHost.ptr<int>(), rcHost.ptr<int>() + nCand * 2);
-                rcCounts[(size_t)listIdx] = nCand;
+                globalsize[0] = (gw + 7u) & ~7u;
+                globalsize[1] = (gh + 7u) & ~7u;
+                localsize[0] = 8; localsize[1] = 8;
             }
+
+            bool ok = ker.args(
+                ocl::KernelArg::PtrReadOnly(uPrevDev),  prev_step,
+                ocl::KernelArg::PtrReadOnly(uCurDev),   cur_step,
+                ocl::KernelArg::PtrReadOnly(uNextDev),  next_step,
+                rows, cols,
+                (float)threshold,
+                ocl::KernelArg::PtrReadWrite(uCounterSlices[(size_t)li]),
+                ocl::KernelArg::PtrWriteOnly(uLayerRcBufs[(size_t)li]),
+                kSiftOclMaxCanPerLayer
+            ).run(2, globalsize, localsize[0] ? localsize : nullptr, false);  // non-blocking
+            if( !ok )
+                return false;
 
             if( i < nOctaveLayers )
             {
@@ -972,6 +1006,26 @@ static bool siftOclFindScaleSpaceExtrema(
                 std::swap(uCurDev, uNextDev);
                 siftCopyToDeviceBuffer(udog_pyr[(size_t)(idx + 2)], uNextDev);
             }
+        }
+
+        // One barrier for all nOctaveLayers kernels of this octave.
+        Mat hCounterOctave;
+        uCounterOctave.copyTo(hCounterOctave);
+
+        // Download candidates for each layer now that counts are known.
+        for( int i = 1; i <= nOctaveLayers; i++ )
+        {
+            const int li    = i - 1;
+            const int nCand = hCounterOctave.at<int>(li);
+            if( nCand <= 0 )
+                continue;
+            if( nCand >= kSiftOclMaxCanPerLayer - 4096 )
+                return false;
+            const int listIdx = o * nOctaveLayers + li;
+            Mat rcHost;
+            uLayerRcBufs[(size_t)li].rowRange(0, nCand).copyTo(rcHost);
+            rcLists[(size_t)listIdx].assign(rcHost.ptr<int>(), rcHost.ptr<int>() + nCand * 2);
+            rcCounts[(size_t)listIdx] = nCand;
         }
     }
 
