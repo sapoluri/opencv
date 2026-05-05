@@ -797,6 +797,101 @@ static bool siftOclAssignOrientationsForImageDevice(
     return true;
 }
 
+struct SiftOclOrientationScratch
+{
+    UMat counter;
+    UMat outKpt;
+    UMat outResp;
+    UMat outOct;
+    int capacity;
+
+    SiftOclOrientationScratch() : capacity(0) {}
+
+    void ensureCapacity(int required)
+    {
+        if( required <= capacity )
+            return;
+        capacity = required;
+        outKpt.create(capacity, 1, CV_32FC4, USAGE_ALLOCATE_DEVICE_MEMORY);
+        outResp.create(capacity, 1, CV_32F, USAGE_ALLOCATE_DEVICE_MEMORY);
+        outOct.create(capacity, 1, CV_32S, USAGE_ALLOCATE_DEVICE_MEMORY);
+    }
+
+    void ensureCounter()
+    {
+        if( counter.empty() )
+            counter.create(1, 1, CV_32S, USAGE_ALLOCATE_DEVICE_MEMORY);
+    }
+};
+
+static bool siftOclAssignOrientationsForImageDeviceReusable(
+    const UMat& uimg,
+    const UMat& uRc,
+    const UMat& uKpt,
+    const UMat& uOct,
+    int n,
+    ocl::Kernel& ker,
+    SiftOclOrientationScratch& scratch,
+    SiftOclImageOrientedKeypoints& out )
+{
+    if( n <= 0 )
+    {
+        out.count = 0;
+        return true;
+    }
+
+    const int maxout = std::max(1, n * kSiftOclOrientationDupFactor);
+    scratch.ensureCounter();
+    scratch.ensureCapacity(maxout);
+    scratch.counter.setTo(Scalar(0));
+
+    size_t globalsize[1] = { (size_t)n };
+    size_t localsize[1] = { 0 };
+    const ocl::Device& dev = ocl::Device::getDefault();
+    if( dev.isIntel() && (dev.type() & ocl::Device::TYPE_GPU) )
+        localsize[0] = 64;
+
+    bool ok = ker.args(
+        ocl::KernelArg::PtrReadOnly(uimg), (int)uimg.step,
+        uimg.rows, uimg.cols,
+        ocl::KernelArg::PtrReadOnly(uRc),
+        ocl::KernelArg::PtrReadOnly(uKpt),
+        ocl::KernelArg::PtrReadOnly(uOct),
+        n,
+        ocl::KernelArg::PtrReadWrite(scratch.counter),
+        ocl::KernelArg::PtrWriteOnly(scratch.outKpt),
+        ocl::KernelArg::PtrWriteOnly(scratch.outResp),
+        ocl::KernelArg::PtrWriteOnly(scratch.outOct),
+        maxout
+    ).run(1, globalsize, localsize[0] ? localsize : NULL, true);
+    if( !ok )
+        return false;
+
+    Mat hCount;
+    scratch.counter.copyTo(hCount);
+    int outCount = hCount.at<int>(0);
+    out.count = outCount;
+    if( outCount <= 0 )
+        return true;
+    if( outCount > maxout )
+        return false;
+
+    if( outCount < scratch.capacity )
+    {
+        out.keypoints = scratch.outKpt.rowRange(0, outCount);
+        out.responses = scratch.outResp.rowRange(0, outCount);
+        out.octaves = scratch.outOct.rowRange(0, outCount);
+    }
+    else
+    {
+        out.keypoints = scratch.outKpt;
+        out.responses = scratch.outResp;
+        out.octaves = scratch.outOct;
+    }
+
+    return true;
+}
+
 static void siftOclDownloadKeypoints(
     const SiftOclImageOrientedKeypoints& oriented,
     std::vector<KeyPoint>& keypoints )
@@ -933,12 +1028,16 @@ static bool siftOclFindScaleSpaceExtrema(
 
     const int nOctaves = (int)ugauss_pyr.size()/(nOctaveLayers + 3);
     TLSDataAccumulator<std::vector<SiftOclProvisionalKeypoint> > tls_refined_struct;
-    // Opt-A: per-layer candidate buffers and a per-octave counter array.
+    // Opt-A: per-layer views over one per-octave candidate buffer plus a per-octave counter array.
     // All nOctaveLayers collect kernels are issued without any intermediate counter readback;
-    // a single uCounterOctave.copyTo() per octave flushes the queue and returns all counts.
-    std::vector<UMat> uLayerRcBufs((size_t)nOctaveLayers);
+    // one counter download and one candidate-buffer download per octave flushes all work.
+    UMat uLayerRcOctave(nOctaveLayers * kSiftOclMaxCanPerLayer, 2, CV_32S, USAGE_ALLOCATE_DEVICE_MEMORY);
+    std::vector<UMat> uLayerRcSlices((size_t)nOctaveLayers);
     for( int j = 0; j < nOctaveLayers; j++ )
-        uLayerRcBufs[(size_t)j].create(kSiftOclMaxCanPerLayer, 2, CV_32S, USAGE_ALLOCATE_DEVICE_MEMORY);
+    {
+        const int r0 = j * kSiftOclMaxCanPerLayer;
+        uLayerRcSlices[(size_t)j] = uLayerRcOctave.rowRange(r0, r0 + kSiftOclMaxCanPerLayer);
+    }
     UMat uCounterOctave(nOctaveLayers, 1, CV_32S, USAGE_ALLOCATE_DEVICE_MEMORY);
     // Pre-build stable row-range sub-UMats so they outlive inner-loop scope across async dispatch.
     std::vector<UMat> uCounterSlices((size_t)nOctaveLayers);
@@ -994,7 +1093,7 @@ static bool siftOclFindScaleSpaceExtrema(
                 rows, cols,
                 (float)threshold,
                 ocl::KernelArg::PtrReadWrite(uCounterSlices[(size_t)li]),
-                ocl::KernelArg::PtrWriteOnly(uLayerRcBufs[(size_t)li]),
+                ocl::KernelArg::PtrWriteOnly(uLayerRcSlices[(size_t)li]),
                 kSiftOclMaxCanPerLayer
             ).run(2, globalsize, localsize[0] ? localsize : nullptr, false);  // non-blocking
             if( !ok )
@@ -1011,6 +1110,8 @@ static bool siftOclFindScaleSpaceExtrema(
         // One barrier for all nOctaveLayers kernels of this octave.
         Mat hCounterOctave;
         uCounterOctave.copyTo(hCounterOctave);
+        Mat hLayerRcOctave;
+        uLayerRcOctave.copyTo(hLayerRcOctave);
 
         // Download candidates for each layer now that counts are known.
         for( int i = 1; i <= nOctaveLayers; i++ )
@@ -1022,9 +1123,9 @@ static bool siftOclFindScaleSpaceExtrema(
             if( nCand >= kSiftOclMaxCanPerLayer - 4096 )
                 return false;
             const int listIdx = o * nOctaveLayers + li;
-            Mat rcHost;
-            uLayerRcBufs[(size_t)li].rowRange(0, nCand).copyTo(rcHost);
-            rcLists[(size_t)listIdx].assign(rcHost.ptr<int>(), rcHost.ptr<int>() + nCand * 2);
+            const int row0 = li * kSiftOclMaxCanPerLayer;
+            const int* p0 = hLayerRcOctave.ptr<int>(row0);
+            rcLists[(size_t)listIdx].assign(p0, p0 + nCand * 2);
             rcCounts[(size_t)listIdx] = nCand;
         }
     }
@@ -1098,6 +1199,16 @@ static bool siftOclFindScaleSpaceExtrema(
         hOct.copyTo(uAllOct);
     }
 
+    const bool canReuseOrientationScratch = (orientedGroups == NULL);
+    ocl::Kernel orientKer;
+    SiftOclOrientationScratch orientScratch;
+    if( canReuseOrientationScratch )
+    {
+        orientKer = ocl::Kernel("SIFT_assignOrientations", ocl::features2d::sift_oclsrc);
+        if( orientKer.empty() )
+            return false;
+    }
+
     for( size_t imageIdx = 0; imageIdx < grouped.size(); ++imageIdx )
     {
         const int begin = imageOffsets[imageIdx];
@@ -1110,7 +1221,10 @@ static bool siftOclFindScaleSpaceExtrema(
         UMat uKpt = uAllKpt.rowRange(begin, end);
         UMat uOct = uAllOct.rowRange(begin, end);
         SiftOclImageOrientedKeypoints oriented;
-        if( !siftOclAssignOrientationsForImageDevice(ugauss_pyr[imageIdx], uRc, uKpt, uOct, count, oriented) )
+        bool ok = canReuseOrientationScratch
+            ? siftOclAssignOrientationsForImageDeviceReusable(ugauss_pyr[imageIdx], uRc, uKpt, uOct, count, orientKer, orientScratch, oriented)
+            : siftOclAssignOrientationsForImageDevice(ugauss_pyr[imageIdx], uRc, uKpt, uOct, count, oriented);
+        if( !ok )
             return false;
         if( orientedGroups )
             (*orientedGroups)[imageIdx] = oriented;
@@ -1149,15 +1263,17 @@ static bool siftTryOpenCLDetectAndCompute(
 
     const bool fullOffload = std::getenv("OPENCV_SIFT_OPENCL_FULL") != NULL;
 
+    // Exit before acquiring any UMat/Mat handles so we pay zero OCL queue-flush cost when
+    // the full GPU descriptor path has not been requested.  The getUMat()/getMat() calls
+    // below can trigger a clEnqueueMapBuffer (and hence an implicit command-queue sync) on
+    // device-backed UMats even when OCL is technically not needed for this call path.
+    if( _descriptors.needed() && !fullOffload )
+        return false;
+
     UMat uimage = _image.getUMat();
     Mat mask = _mask.getMat();
 
     if( uimage.empty() || uimage.depth() != CV_8U )
-        return false;
-
-    // Full OpenCL detect+describe remains experimental. The average end-to-end benchmark
-    // cost is still better with the CPU descriptor path unless this mode is requested.
-    if( _descriptors.needed() && !fullOffload )
         return false;
 
     // Skip OpenCL SIFT on very small inputs: host↔device and kernel launch costs dominate.
