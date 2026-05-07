@@ -549,3 +549,201 @@ __kernel void SIFT_computeDescriptors(
     for (int i = 0; i < SIFT_DESCR_WIDTH * SIFT_DESCR_WIDTH * SIFT_DESCR_HIST_BINS; ++i)
         out_row[i] = clamp(rint(rawDst[i] * scale), 0.0f, 255.0f);
 }
+
+// ---------------------------------------------------------------------------
+// Two-pass descriptor computation
+// ---------------------------------------------------------------------------
+// Pass 1 – LDS-buffered accumulation.
+//
+// Identical accumulation logic to SIFT_computeDescriptors, but the 128-element
+// histogram is kept in local memory (LDS) rather than in private registers.
+// Moving the histogram out of the register file reduces VGPR pressure and
+// allows the OpenCL runtime to schedule more waves per compute unit, improving
+// occupancy.  Each work item owns a contiguous 128-float slot in lds_pool:
+//   slot i = lds_pool[lid * NELEMS .. lid * NELEMS + NELEMS - 1]
+// where lid = get_local_id(0).
+//
+// Output: raw (un-normalised) float histograms written to raw_out_base.
+// Normalisation is deferred to the separate SIFT_normalizeDescriptors kernel,
+// which removes the normalization register pressure from this kernel entirely.
+__kernel void SIFT_computeDescriptors_ldsAccum(
+    __global const uchar* restrict img_base,
+    int img_step,
+    int rows,
+    int cols,
+    __global const float4* restrict in_kpt,
+    int nKp,
+    __global uchar* restrict raw_out_base,
+    int raw_out_step,
+    __local float* lds_pool)   /* get_local_size(0) * NELEMS floats */
+{
+    int idx = (int)get_global_id(0);
+    if (idx >= nKp)
+        return;
+
+    const int NELEMS = SIFT_DESCR_WIDTH * SIFT_DESCR_WIDTH * SIFT_DESCR_HIST_BINS;
+    int lid = (int)get_local_id(0);
+    __local float* rawDst = lds_pool + (size_t)lid * NELEMS;
+
+    for (int i = 0; i < NELEMS; ++i)
+        rawDst[i] = 0.0f;
+
+    float4 kp = in_kpt[idx];
+    float pt_x = kp.x;
+    float pt_y = kp.y;
+    float scl = kp.z * 0.5f;
+    float ori = 360.0f - kp.w;
+    if (fabs(ori - 360.0f) < 1e-6f)
+        ori = 0.0f;
+
+    int pt_ix = convert_int_rte(pt_x);
+    int pt_iy = convert_int_rte(pt_y);
+    float cos_t = cos(radians(ori));
+    float sin_t = sin(radians(ori));
+    float bins_per_rad = SIFT_DESCR_HIST_BINS / 360.0f;
+    float exp_scale = -1.0f / (SIFT_DESCR_WIDTH * SIFT_DESCR_WIDTH * 0.5f);
+    float hist_width = SIFT_DESCR_SCL_FCTR * scl;
+    int radius = convert_int_rte(hist_width * 1.4142135623730951f * (SIFT_DESCR_WIDTH + 1) * 0.5f);
+    int max_radius = convert_int_rte(sqrt((float)(cols * cols + rows * rows)));
+    if (radius > max_radius)
+        radius = max_radius;
+    cos_t /= hist_width;
+    sin_t /= hist_width;
+
+    for (int i = -radius; i <= radius; ++i)
+    {
+        for (int j = -radius; j <= radius; ++j)
+        {
+            float c_rot = j * cos_t - i * sin_t;
+            float r_rot = j * sin_t + i * cos_t;
+            float rbin = r_rot + SIFT_DESCR_WIDTH * 0.5f - 0.5f;
+            float cbin = c_rot + SIFT_DESCR_WIDTH * 0.5f - 0.5f;
+            int r = pt_iy + i;
+            int c = pt_ix + j;
+            if (!(rbin > -1.0f && rbin < SIFT_DESCR_WIDTH && cbin > -1.0f && cbin < SIFT_DESCR_WIDTH &&
+                  r > 0 && r < rows - 1 && c > 0 && c < cols - 1))
+                continue;
+
+            float dx = read_dog(img_base, img_step, r, c + 1) - read_dog(img_base, img_step, r, c - 1);
+            float dy = read_dog(img_base, img_step, r - 1, c) - read_dog(img_base, img_step, r + 1, c);
+            float mag = hypot(dx, dy);
+            float sample_ori = sift_angle_deg(dy, dx);
+            float obin = (sample_ori - ori) * bins_per_rad;
+            float w = exp((c_rot * c_rot + r_rot * r_rot) * exp_scale);
+
+            int r0 = convert_int_sat_rtn(floor(rbin));
+            int c0 = convert_int_sat_rtn(floor(cbin));
+            int o0 = convert_int_sat_rtn(floor(obin));
+            rbin -= (float)r0;
+            cbin -= (float)c0;
+            obin -= (float)o0;
+
+            while (o0 < 0)
+                o0 += SIFT_DESCR_HIST_BINS;
+            while (o0 >= SIFT_DESCR_HIST_BINS)
+                o0 -= SIFT_DESCR_HIST_BINS;
+
+            float v_r1 = mag * w * rbin;
+            float v_r0 = mag * w - v_r1;
+            float v_rc11 = v_r1 * cbin;
+            float v_rc10 = v_r1 - v_rc11;
+            float v_rc01 = v_r0 * cbin;
+            float v_rc00 = v_r0 - v_rc01;
+            float v_rco111 = v_rc11 * obin;
+            float v_rco110 = v_rc11 - v_rco111;
+            float v_rco101 = v_rc10 * obin;
+            float v_rco100 = v_rc10 - v_rco101;
+            float v_rco011 = v_rc01 * obin;
+            float v_rco010 = v_rc01 - v_rco011;
+            float v_rco001 = v_rc00 * obin;
+            float v_rco000 = v_rc00 - v_rco001;
+
+            int o1 = o0 + 1;
+            if (o1 >= SIFT_DESCR_HIST_BINS)
+                o1 -= SIFT_DESCR_HIST_BINS;
+
+            if (r0 >= 0 && r0 < SIFT_DESCR_WIDTH)
+            {
+                if (c0 >= 0 && c0 < SIFT_DESCR_WIDTH)
+                {
+                    int base = (r0 * SIFT_DESCR_WIDTH + c0) * SIFT_DESCR_HIST_BINS;
+                    rawDst[base + o0] += v_rco000;
+                    rawDst[base + o1] += v_rco001;
+                }
+                if (c0 + 1 >= 0 && c0 + 1 < SIFT_DESCR_WIDTH)
+                {
+                    int base = (r0 * SIFT_DESCR_WIDTH + (c0 + 1)) * SIFT_DESCR_HIST_BINS;
+                    rawDst[base + o0] += v_rco010;
+                    rawDst[base + o1] += v_rco011;
+                }
+            }
+            if (r0 + 1 >= 0 && r0 + 1 < SIFT_DESCR_WIDTH)
+            {
+                if (c0 >= 0 && c0 < SIFT_DESCR_WIDTH)
+                {
+                    int base = ((r0 + 1) * SIFT_DESCR_WIDTH + c0) * SIFT_DESCR_HIST_BINS;
+                    rawDst[base + o0] += v_rco100;
+                    rawDst[base + o1] += v_rco101;
+                }
+                if (c0 + 1 >= 0 && c0 + 1 < SIFT_DESCR_WIDTH)
+                {
+                    int base = ((r0 + 1) * SIFT_DESCR_WIDTH + (c0 + 1)) * SIFT_DESCR_HIST_BINS;
+                    rawDst[base + o0] += v_rco110;
+                    rawDst[base + o1] += v_rco111;
+                }
+            }
+        }
+    }
+
+    /* Write raw (un-normalised) histogram to global output buffer. */
+    __global float* out_row = (__global float*)(raw_out_base + (size_t)idx * (size_t)raw_out_step);
+    for (int i = 0; i < NELEMS; ++i)
+        out_row[i] = rawDst[i];
+}
+
+// Pass 2 – normalisation.
+//
+// Reads the raw 128-float histograms produced by SIFT_computeDescriptors_ldsAccum,
+// applies L2-norm clamping and re-normalisation (matching the CPU path), and
+// writes the final CV_32F descriptor row.  Running this as a separate kernel
+// completely removes all normalisation register pressure from the accumulation
+// kernel, giving the runtime more latitude to pack accumulation waves tightly.
+//
+// Implementation note: a three-pass streaming approach over `src` is used to
+// avoid declaring a 128-element private float array (which can spill to memory
+// on GPU architectures with limited register files).  The 128-float working set
+// (~0.5 KB) is small enough to remain in L1 cache across all three passes.
+__kernel void SIFT_normalizeDescriptors(
+    __global const uchar* restrict raw_in_base,
+    int raw_in_step,
+    int nKp,
+    __global uchar* restrict out_base,
+    int out_step)
+{
+    int idx = (int)get_global_id(0);
+    if (idx >= nKp)
+        return;
+
+    const int NELEMS = SIFT_DESCR_WIDTH * SIFT_DESCR_WIDTH * SIFT_DESCR_HIST_BINS;
+    __global const float* src = (__global const float*)(raw_in_base + (size_t)idx * (size_t)raw_in_step);
+
+    /* Pass 1: compute initial L2 norm to derive the clamping threshold. */
+    float nrm2 = 0.0f;
+    for (int i = 0; i < NELEMS; ++i)
+        nrm2 += src[i] * src[i];
+    float thr = sqrt(nrm2) * SIFT_DESCR_MAG_THR;
+
+    /* Pass 2: re-read src and compute norm of the clamped values. */
+    nrm2 = 0.0f;
+    for (int i = 0; i < NELEMS; ++i)
+    {
+        float v = fmin(src[i], thr);
+        nrm2 += v * v;
+    }
+    float scale = SIFT_INT_DESCR_FCTR / fmax(sqrt(nrm2), FLT_EPSILON);
+
+    /* Pass 3: re-read src, clamp, scale, and write final descriptor. */
+    __global float* out_row = (__global float*)(out_base + (size_t)idx * (size_t)out_step);
+    for (int i = 0; i < NELEMS; ++i)
+        out_row[i] = clamp(rint(fmin(src[i], thr) * scale), 0.0f, 255.0f);
+}

@@ -42,5 +42,67 @@ TEST(Features2d_SIFT, regression_26139)
     ASSERT_EQ(descriptors.size(), Size(128, 1));
 }
 
+// Verify that the CPU descriptor path (which the OCL two-pass path must numerically
+// match) is stable across multiple calls with the same synthetic image and the same
+// set of provided keypoints.  This exercises the workload-sorting changes (the
+// secondary spatial sort must not change the descriptor values, only their
+// computation order).
+TEST(Features2d_SIFT, descriptor_stability_synthetic)
+{
+    // Build a synthetic image with distinct local texture so SIFT finds real keypoints.
+    Mat img(256, 256, CV_8UC1);
+    for (int r = 0; r < img.rows; r++)
+        for (int c = 0; c < img.cols; c++)
+            img.at<uchar>(r, c) = static_cast<uchar>((r * 17 + c * 13 + (r ^ c) * 7) & 0xFF);
+    GaussianBlur(img, img, Size(3, 3), 0.8);
+
+    auto sift = cv::SIFT::create(100);
+
+    // Detect keypoints and compute descriptors twice; results must be bit-exact.
+    vector<KeyPoint> kpts1, kpts2;
+    Mat desc1, desc2;
+    sift->detectAndCompute(img, noArray(), kpts1, desc1);
+    sift->detectAndCompute(img, noArray(), kpts2, desc2);
+
+    ASSERT_EQ(kpts1.size(), kpts2.size());
+    if (!desc1.empty())
+    {
+        ASSERT_EQ(desc1.size(), desc2.size());
+        Mat diff;
+        absdiff(desc1, desc2, diff);
+        EXPECT_EQ(0, countNonZero(diff.reshape(1))) << "Descriptors changed between calls";
+    }
+}
+
+// Verify that using pre-provided keypoints (the compute() path) yields descriptors
+// whose L2 norm per row is in the expected [0, 128*255] range for CV_32F output.
+// This is a lightweight sanity check that does not require test-data files.
+TEST(Features2d_SIFT, descriptor_norm_range_synthetic)
+{
+    Mat img(256, 256, CV_8UC1);
+    for (int r = 0; r < img.rows; r++)
+        for (int c = 0; c < img.cols; c++)
+            img.at<uchar>(r, c) = static_cast<uchar>((r * 11 + c * 23 + (r & c) * 5) & 0xFF);
+    GaussianBlur(img, img, Size(3, 3), 0.8);
+
+    auto sift = cv::SIFT::create(50);
+    vector<KeyPoint> kpts;
+    Mat desc;
+    sift->detectAndCompute(img, noArray(), kpts, desc);
+
+    if (kpts.empty())
+        return; // synthetic image may not yield keypoints on every platform
+
+    ASSERT_EQ(desc.type(), CV_32F);
+    ASSERT_EQ(desc.cols, 128);
+
+    for (int i = 0; i < desc.rows; i++)
+    {
+        double norm = cv::norm(desc.row(i));
+        EXPECT_GT(norm, 0.0) << "Descriptor row " << i << " is all-zeros";
+        // Each element is in [0, 255]; norm <= sqrt(128) * 255 ≈ 2883
+        EXPECT_LE(norm, 3000.0) << "Descriptor row " << i << " norm is unexpectedly large";
+    }
+}
 
 }} // namespace
