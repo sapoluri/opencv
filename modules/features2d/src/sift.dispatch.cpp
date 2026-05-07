@@ -1022,15 +1022,19 @@ namespace cv
                 ordered.push_back(entry);
             }
 
+            // Sort by imageIdx first, then by spatial position (row, col) within each
+            // image group.  The secondary sort gives consecutive work items in a warp
+            // spatially adjacent keypoints, improving L2 cache utilisation during the
+            // descriptor gradient-sampling loop.
             std::stable_sort(ordered.begin(), ordered.end(),
                              [](const SiftOclDescriptorEntry &a, const SiftOclDescriptorEntry &b)
                              {
-                                 return a.imageIdx < b.imageIdx;
+                                 if (a.imageIdx != b.imageIdx)
+                                     return a.imageIdx < b.imageIdx;
+                                 if (a.packed[1] != b.packed[1])
+                                     return a.packed[1] < b.packed[1];
+                                 return a.packed[0] < b.packed[0];
                              });
-
-            ocl::Kernel ker("SIFT_computeDescriptors", ocl::features2d::sift_oclsrc, siftOclBuildOptions());
-            if (ker.empty())
-                return false;
 
             Mat hAllKpt((int)ordered.size(), 1, CV_32FC4);
             for (int i = 0; i < hAllKpt.rows; ++i)
@@ -1039,41 +1043,175 @@ namespace cv
             UMat uAllKpt, uAllDesc((int)ordered.size(), descriptors.cols, CV_32F, USAGE_ALLOCATE_DEVICE_MEMORY);
             hAllKpt.copyTo(uAllKpt);
 
-            int offset = 0;
-            for (size_t imageIdx = 0; imageIdx < groups.size(); ++imageIdx)
+            // ------------------------------------------------------------------
+            // Two-pass path: LDS-buffered accumulation + separate normalisation.
+            //
+            // Pass 1 (SIFT_computeDescriptors_ldsAccum): accumulates the raw
+            // 128-element histogram into __local memory, reducing VGPR pressure
+            // and improving wave occupancy.  Outputs unnormalised float histograms
+            // to a temporary device buffer (uRawHist).
+            //
+            // Pass 2 (SIFT_normalizeDescriptors): reads uRawHist and writes the
+            // final normalised CV_32F descriptors to uAllDesc in a single
+            // non-blocking dispatch covering all keypoints at once.
+            //
+            // Both passes are dispatched non-blocking; a single copyTo at the end
+            // acts as the implicit barrier (out-of-order amortisation).
+            //
+            // Falls back to the original single-pass kernel on build failure.
+            // ------------------------------------------------------------------
             {
-                const std::vector<int> &group = groups[imageIdx];
-                if (group.empty())
-                    continue;
+                ocl::Kernel kerAccum("SIFT_computeDescriptors_ldsAccum",
+                                     ocl::features2d::sift_oclsrc, siftOclBuildOptions());
+                ocl::Kernel kerNorm("SIFT_normalizeDescriptors",
+                                    ocl::features2d::sift_oclsrc, siftOclBuildOptions());
 
-                size_t globalsize[1] = {group.size()};
-                size_t local = siftPreferredLocal1D(ker, globalsize[0]);
-                const ocl::Device &descDev = ocl::Device::getDefault();
-                if (descDev.isIntel() && (descDev.type() & ocl::Device::TYPE_GPU))
-                    local = siftEnvLocalSize1D("OPENCV_SIFT_OCL_DESC_LOCAL", 128, ker.workGroupSize(), globalsize[0]);
-                size_t localsize[1] = {local};
-                if (localsize[0])
-                    globalsize[0] = ((globalsize[0] + localsize[0] - 1) / localsize[0]) * localsize[0];
-                UMat uKpt = uAllKpt.rowRange(offset, offset + (int)group.size());
-                UMat uDesc = uAllDesc.rowRange(offset, offset + (int)group.size());
-                bool ok = ker.args(
-                                 ocl::KernelArg::PtrReadOnly(ugpyr[imageIdx]), (int)ugpyr[imageIdx].step,
-                                 ugpyr[imageIdx].rows, ugpyr[imageIdx].cols,
-                                 ocl::KernelArg::PtrReadOnly(uKpt), (int)group.size(),
-                                 ocl::KernelArg::PtrWriteOnly(uDesc), (int)uDesc.step)
-                              .run(1, globalsize, localsize[0] ? localsize : NULL, false);
-                if (!ok)
-                    return false;
+                if (!kerAccum.empty() && !kerNorm.empty())
+                {
+                    UMat uRawHist((int)ordered.size(), descriptors.cols, CV_32F,
+                                  USAGE_ALLOCATE_DEVICE_MEMORY);
 
-                offset += (int)group.size();
+                    const ocl::Device &descDev = ocl::Device::getDefault();
+
+                    // Work-group size for pass 1.  Cap at 64 so that the LDS pool
+                    // (local * 128 * 4 bytes) stays within a safe 32 KB budget.
+                    // The Intel-GPU branch follows the same siftEnvLocalSize1D pattern
+                    // used elsewhere in this file for pass-specific tuning.
+                    size_t localAccum = siftPreferredLocal1D(kerAccum, (size_t)ordered.size());
+                    if (descDev.isIntel() && (descDev.type() & ocl::Device::TYPE_GPU))
+                        localAccum = siftEnvLocalSize1D("OPENCV_SIFT_OCL_DESC_LDS_LOCAL", 64,
+                                                        kerAccum.workGroupSize(),
+                                                        (size_t)ordered.size());
+                    if (localAccum > 64)
+                        localAccum = 64; // hard cap: 64 * 128 * 4 = 32 KB LDS
+                    // The LDS kernel requires an explicit, non-zero work-group size so
+                    // that the LDS pool can be sized correctly.  Fall back to a single
+                    // work-item per group if the device provides no preference.
+                    if (localAccum == 0)
+                        localAccum = 1;
+
+                    int offset = 0;
+                    bool twoPassOk = true;
+                    for (size_t imageIdx = 0; imageIdx < groups.size(); ++imageIdx)
+                    {
+                        const std::vector<int> &group = groups[imageIdx];
+                        if (group.empty())
+                            continue;
+
+                        size_t gs[1] = {group.size()};
+                        size_t ls[1] = {localAccum};
+                        gs[0] = ((gs[0] + ls[0] - 1) / ls[0]) * ls[0];
+
+                        // LDS pool: one 128-float slot per work item in the group.
+                        CV_Assert(ls[0] > 0);
+                        size_t ldsBytes = ls[0] * (size_t)descriptors.cols * sizeof(float);
+
+                        UMat uKpt  = uAllKpt.rowRange(offset, offset + (int)group.size());
+                        UMat uRaw  = uRawHist.rowRange(offset, offset + (int)group.size());
+                        bool ok = kerAccum.args(
+                                             ocl::KernelArg::PtrReadOnly(ugpyr[imageIdx]),
+                                             (int)ugpyr[imageIdx].step,
+                                             ugpyr[imageIdx].rows, ugpyr[imageIdx].cols,
+                                             ocl::KernelArg::PtrReadOnly(uKpt),
+                                             (int)group.size(),
+                                             ocl::KernelArg::PtrWriteOnly(uRaw),
+                                             (int)uRaw.step,
+                                             ocl::KernelArg::Local(ldsBytes))
+                                          .run(1, gs, ls, false);
+                        if (!ok)
+                        {
+                            twoPassOk = false;
+                            break;
+                        }
+                        offset += (int)group.size();
+                    }
+
+                    if (twoPassOk)
+                    {
+                        CV_Assert(offset == (int)ordered.size());
+
+                        // Pass 2: normalise all keypoints in one dispatch (no image
+                        // pyramid dependency – the kernel is purely arithmetic).
+                        size_t normGs[1] = {(size_t)ordered.size()};
+                        size_t normLocal = siftPreferredLocal1D(kerNorm, normGs[0]);
+                        if (descDev.isIntel() && (descDev.type() & ocl::Device::TYPE_GPU))
+                            normLocal = siftEnvLocalSize1D("OPENCV_SIFT_OCL_NORM_LOCAL", 128,
+                                                           kerNorm.workGroupSize(), normGs[0]);
+                        size_t normLs[1] = {normLocal};
+                        if (normLs[0])
+                            normGs[0] = ((normGs[0] + normLs[0] - 1) / normLs[0]) * normLs[0];
+
+                        bool ok = kerNorm.args(
+                                             ocl::KernelArg::PtrReadOnly(uRawHist),
+                                             (int)uRawHist.step,
+                                             (int)ordered.size(),
+                                             ocl::KernelArg::PtrWriteOnly(uAllDesc),
+                                             (int)uAllDesc.step)
+                                          .run(1, normGs, normLs[0] ? normLs : nullptr, false);
+                        if (ok)
+                        {
+                            // Single barrier: one copyTo covers both kernel passes.
+                            Mat hAllDesc;
+                            uAllDesc.copyTo(hAllDesc);
+                            for (int i = 0; i < hAllDesc.rows; ++i)
+                                hAllDesc.row(i).copyTo(
+                                    descriptors.row(ordered[(size_t)i].originalIdx));
+                            return true;
+                        }
+                    }
+                    // Fall through to single-pass on any failure.
+                }
             }
 
-            CV_Assert(offset == (int)ordered.size());
+            // ------------------------------------------------------------------
+            // Single-pass fallback (original kernel).
+            // ------------------------------------------------------------------
+            {
+                ocl::Kernel ker("SIFT_computeDescriptors", ocl::features2d::sift_oclsrc,
+                                siftOclBuildOptions());
+                if (ker.empty())
+                    return false;
 
-            Mat hAllDesc;
-            uAllDesc.copyTo(hAllDesc);
-            for (int i = 0; i < hAllDesc.rows; ++i)
-                hAllDesc.row(i).copyTo(descriptors.row(ordered[(size_t)i].originalIdx));
+                const ocl::Device &descDev = ocl::Device::getDefault();
+
+                int offset = 0;
+                for (size_t imageIdx = 0; imageIdx < groups.size(); ++imageIdx)
+                {
+                    const std::vector<int> &group = groups[imageIdx];
+                    if (group.empty())
+                        continue;
+
+                    size_t globalsize[1] = {group.size()};
+                    size_t local = siftPreferredLocal1D(ker, globalsize[0]);
+                    if (descDev.isIntel() && (descDev.type() & ocl::Device::TYPE_GPU))
+                        local = siftEnvLocalSize1D("OPENCV_SIFT_OCL_DESC_LOCAL", 128,
+                                                   ker.workGroupSize(), globalsize[0]);
+                    size_t localsize[1] = {local};
+                    if (localsize[0])
+                        globalsize[0] = ((globalsize[0] + localsize[0] - 1) / localsize[0]) *
+                                        localsize[0];
+                    UMat uKpt  = uAllKpt.rowRange(offset, offset + (int)group.size());
+                    UMat uDesc = uAllDesc.rowRange(offset, offset + (int)group.size());
+                    bool ok = ker.args(
+                                     ocl::KernelArg::PtrReadOnly(ugpyr[imageIdx]),
+                                     (int)ugpyr[imageIdx].step,
+                                     ugpyr[imageIdx].rows, ugpyr[imageIdx].cols,
+                                     ocl::KernelArg::PtrReadOnly(uKpt), (int)group.size(),
+                                     ocl::KernelArg::PtrWriteOnly(uDesc), (int)uDesc.step)
+                                  .run(1, globalsize, localsize[0] ? localsize : nullptr, false);
+                    if (!ok)
+                        return false;
+
+                    offset += (int)group.size();
+                }
+
+                CV_Assert(offset == (int)ordered.size());
+
+                Mat hAllDesc;
+                uAllDesc.copyTo(hAllDesc);
+                for (int i = 0; i < hAllDesc.rows; ++i)
+                    hAllDesc.row(i).copyTo(descriptors.row(ordered[(size_t)i].originalIdx));
+            }
 
             return true;
         }
