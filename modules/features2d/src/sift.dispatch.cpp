@@ -607,6 +607,37 @@ namespace cv
             return local;
         }
 
+        static size_t siftEnvLocalSize1D(const char *envName, size_t fallback, size_t maxWg, size_t n)
+        {
+            size_t local = fallback;
+            if (const char *e = std::getenv(envName))
+            {
+                const int parsed = std::max(1, atoi(e));
+                local = (size_t)parsed;
+            }
+            if (maxWg > 0)
+                local = std::min(local, maxWg);
+            while (local > n && local > 1)
+                local >>= 1;
+            return local;
+        }
+
+        static void siftIntelCollectLocal2D(size_t gw, size_t gh, size_t maxWg, size_t localsize[2], size_t globalsize[2])
+        {
+            // CudaSift uses fixed launch geometry per kernel family; mirror that idea here by
+            // preferring a stable 128-thread tile for the extrema-collect pass on Intel GPU.
+            size_t lx = 16, ly = 8;
+            if (maxWg > 0 && lx * ly > maxWg)
+            {
+                lx = 8;
+                ly = 8;
+            }
+            localsize[0] = lx;
+            localsize[1] = ly;
+            globalsize[0] = ((gw + lx - 1) / lx) * lx;
+            globalsize[1] = ((gh + ly - 1) / ly) * ly;
+        }
+
         class siftBuildDoGPyramidUMatComputer : public ParallelLoopBody
         {
         public:
@@ -686,10 +717,7 @@ namespace cv
             const ocl::Device &dev = ocl::Device::getDefault();
             if (dev.isIntel() && (dev.type() & ocl::Device::TYPE_GPU))
             {
-                globalsize[0] = (gw + 7u) & ~7u;
-                globalsize[1] = (gh + 7u) & ~7u;
-                localsize[0] = 8;
-                localsize[1] = 8;
+                siftIntelCollectLocal2D(gw, gh, ker.workGroupSize(), localsize, globalsize);
             }
 
             bool ok = ker.args(
@@ -783,7 +811,11 @@ namespace cv
                 return false;
 
             size_t globalsize[1] = {(size_t)n};
-            size_t localsize[1] = {siftPreferredLocal1D(ker, (size_t)n)};
+            size_t local = siftPreferredLocal1D(ker, (size_t)n);
+            const ocl::Device &dev = ocl::Device::getDefault();
+            if (dev.isIntel() && (dev.type() & ocl::Device::TYPE_GPU))
+                local = siftEnvLocalSize1D("OPENCV_SIFT_OCL_ORI_LOCAL", 64, ker.workGroupSize(), (size_t)n);
+            size_t localsize[1] = {local};
             if (localsize[0])
                 globalsize[0] = ((globalsize[0] + localsize[0] - 1) / localsize[0]) * localsize[0];
             bool ok = ker.args(
@@ -876,7 +908,11 @@ namespace cv
             scratch.counter.setTo(Scalar(0));
 
             size_t globalsize[1] = {(size_t)n};
-            size_t localsize[1] = {siftPreferredLocal1D(ker, (size_t)n)};
+            size_t local = siftPreferredLocal1D(ker, (size_t)n);
+            const ocl::Device &dev = ocl::Device::getDefault();
+            if (dev.isIntel() && (dev.type() & ocl::Device::TYPE_GPU))
+                local = siftEnvLocalSize1D("OPENCV_SIFT_OCL_ORI_LOCAL", 64, ker.workGroupSize(), (size_t)n);
+            size_t localsize[1] = {local};
             if (localsize[0])
                 globalsize[0] = ((globalsize[0] + localsize[0] - 1) / localsize[0]) * localsize[0];
 
@@ -1011,7 +1047,11 @@ namespace cv
                     continue;
 
                 size_t globalsize[1] = {group.size()};
-                size_t localsize[1] = {siftPreferredLocal1D(ker, globalsize[0])};
+                size_t local = siftPreferredLocal1D(ker, globalsize[0]);
+                const ocl::Device &descDev = ocl::Device::getDefault();
+                if (descDev.isIntel() && (descDev.type() & ocl::Device::TYPE_GPU))
+                    local = siftEnvLocalSize1D("OPENCV_SIFT_OCL_DESC_LOCAL", 128, ker.workGroupSize(), globalsize[0]);
+                size_t localsize[1] = {local};
                 if (localsize[0])
                     globalsize[0] = ((globalsize[0] + localsize[0] - 1) / localsize[0]) * localsize[0];
                 UMat uKpt = uAllKpt.rowRange(offset, offset + (int)group.size());
@@ -1021,7 +1061,7 @@ namespace cv
                                  ugpyr[imageIdx].rows, ugpyr[imageIdx].cols,
                                  ocl::KernelArg::PtrReadOnly(uKpt), (int)group.size(),
                                  ocl::KernelArg::PtrWriteOnly(uDesc), (int)uDesc.step)
-                              .run(1, globalsize, localsize[0] ? localsize : NULL, true);
+                              .run(1, globalsize, localsize[0] ? localsize : NULL, false);
                 if (!ok)
                     return false;
 
@@ -1107,10 +1147,7 @@ namespace cv
                     globalsize[1] = gh;
                     if (collectIsIntelGPU)
                     {
-                        globalsize[0] = (gw + 7u) & ~7u;
-                        globalsize[1] = (gh + 7u) & ~7u;
-                        localsize[0] = 8;
-                        localsize[1] = 8;
+                        siftIntelCollectLocal2D(gw, gh, ker.workGroupSize(), localsize, globalsize);
                     }
 
                     bool ok = ker.args(
