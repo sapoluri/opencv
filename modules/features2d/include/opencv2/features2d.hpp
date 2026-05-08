@@ -271,10 +271,16 @@ path to avoid kernel launch overhead. The implementation also falls back to CPU 
 kernels are unavailable, or descriptorType is CV_8U. Numerical results are expected to agree with the
 cv::Mat path within small floating-point tolerances.
 
-Environment variables:
-- OPENCV_SIFT_OPENCL_FULL=1 : force GPU path for all image sizes (including small images)
-- OPENCV_SIFT_CPU_FALLBACK_OCL_MIN_PIXELS=N : override the default 640×480 pixel threshold
-- OPENCV_SIFT_OPENCL_FORCE=1 : skip minimum-size guard inside the GPU path
+Environment variables for tuning GPU behaviour:
+- OPENCV_SIFT_CPU_FALLBACK_OCL_MIN_PIXELS=N : override the outer size threshold (default 640×480).
+  Images with fewer pixels disable OpenCL before calling the GPU path. Use a smaller value to
+  enable GPU for smaller images, or 0 to always attempt GPU regardless of image size.
+- OPENCV_SIFT_OPENCL_FULL=1 : equivalent to OPENCV_SIFT_CPU_FALLBACK_OCL_MIN_PIXELS=0; bypasses
+  the outer size-based GPU disable so that GPU is attempted for all image sizes.
+- OPENCV_SIFT_OPENCL_MIN_PIXELS=N, OPENCV_SIFT_OPENCL_MIN_SIDE=N : fine-tune the secondary
+  size guard inside the GPU path (defaults: ~196608 px / 384 px shorter side).
+- OPENCV_SIFT_OPENCL_FORCE=1 : bypass the secondary size guard inside the GPU path entirely
+  (useful when OPENCV_SIFT_OPENCL_FULL is also set and very small images must run on GPU).
 */
 class CV_EXPORTS_W SIFT : public Feature2D
 {
