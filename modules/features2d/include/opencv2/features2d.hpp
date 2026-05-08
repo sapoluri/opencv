@@ -278,7 +278,8 @@ Environment variables for tuning GPU behaviour:
 - OPENCV_SIFT_OPENCL_FULL=1 : equivalent to OPENCV_SIFT_CPU_FALLBACK_OCL_MIN_PIXELS=0; bypasses
   the outer size-based GPU disable so that GPU is attempted for all image sizes.
 - OPENCV_SIFT_OPENCL_MIN_PIXELS=N, OPENCV_SIFT_OPENCL_MIN_SIDE=N : fine-tune the secondary
-  size guard inside the GPU path (defaults: ~196608 px / 384 px shorter side).
+  size guard inside `siftTryOpenCLDetectAndCompute` (defaults: ~196608 px / 384 px shorter side).
+  Images below either limit return false from the GPU path even when the outer threshold is met.
 - OPENCV_SIFT_OPENCL_FORCE=1 : bypass the secondary size guard inside the GPU path entirely
   (useful when OPENCV_SIFT_OPENCL_FULL is also set and very small images must run on GPU).
 */

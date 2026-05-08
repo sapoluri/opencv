@@ -141,7 +141,6 @@ TEST(Features2d_SIFT, umat_large_image_descriptors_consistent)
     vector<KeyPoint> kptsGpu;
     Mat descGpu;
     sift->detectAndCompute(uimg, noArray(), kptsGpu, descGpu);
-    // OCL state is already prevOclState at this point.
 
     // Both paths must detect keypoints on this synthetic image
     EXPECT_FALSE(kptsCpu.empty()) << "CPU path found no keypoints on synthetic image";
