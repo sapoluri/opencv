@@ -304,11 +304,6 @@ __kernel void SIFT_refineExtremaCandidates(
 #define SIFT_DESCR_MAG_THR 0.2f
 #define SIFT_INT_DESCR_FCTR 512.0f
 
-// Pre-computed constants derived from the above; computed by the compiler from
-// #defines so all uses below are constant-folded at OpenCL compile time.
-#define SIFT_DESCR_BINS_PER_RAD  (SIFT_DESCR_HIST_BINS / 360.0f)
-#define SIFT_DESCR_EXP_SCALE     (-1.0f / (SIFT_DESCR_WIDTH * SIFT_DESCR_WIDTH * 0.5f))
-
 inline float sift_angle_deg(float y, float x)
 {
     float a = degrees(atan2(y, x));
@@ -439,6 +434,8 @@ __kernel void SIFT_computeDescriptors(
     int pt_iy = convert_int_rte(pt_y);
     float cos_t = cos(radians(ori));
     float sin_t = sin(radians(ori));
+    float bins_per_rad = SIFT_DESCR_HIST_BINS / 360.0f;
+    float exp_scale = -1.0f / (SIFT_DESCR_WIDTH * SIFT_DESCR_WIDTH * 0.5f);
     float hist_width = SIFT_DESCR_SCL_FCTR * scl;
     int radius = convert_int_rte(hist_width * 1.4142135623730951f * (SIFT_DESCR_WIDTH + 1) * 0.5f);
     int max_radius = convert_int_rte(sqrt((float)(cols * cols + rows * rows)));
@@ -469,8 +466,8 @@ __kernel void SIFT_computeDescriptors(
             float dy = read_dog(img_base, img_step, r - 1, c) - read_dog(img_base, img_step, r + 1, c);
             float mag = hypot(dx, dy);
             float sample_ori = sift_angle_deg(dy, dx);
-            float obin = (sample_ori - ori) * SIFT_DESCR_BINS_PER_RAD;
-            float w = exp((c_rot * c_rot + r_rot * r_rot) * SIFT_DESCR_EXP_SCALE);
+            float obin = (sample_ori - ori) * bins_per_rad;
+            float w = exp((c_rot * c_rot + r_rot * r_rot) * exp_scale);
 
             int r0 = convert_int_sat_rtn(floor(rbin));
             int c0 = convert_int_sat_rtn(floor(cbin));
@@ -603,6 +600,8 @@ __kernel void SIFT_computeDescriptors_ldsAccum(
     int pt_iy = convert_int_rte(pt_y);
     float cos_t = cos(radians(ori));
     float sin_t = sin(radians(ori));
+    float bins_per_rad = SIFT_DESCR_HIST_BINS / 360.0f;
+    float exp_scale = -1.0f / (SIFT_DESCR_WIDTH * SIFT_DESCR_WIDTH * 0.5f);
     float hist_width = SIFT_DESCR_SCL_FCTR * scl;
     int radius = convert_int_rte(hist_width * 1.4142135623730951f * (SIFT_DESCR_WIDTH + 1) * 0.5f);
     int max_radius = convert_int_rte(sqrt((float)(cols * cols + rows * rows)));
@@ -629,8 +628,8 @@ __kernel void SIFT_computeDescriptors_ldsAccum(
             float dy = read_dog(img_base, img_step, r - 1, c) - read_dog(img_base, img_step, r + 1, c);
             float mag = hypot(dx, dy);
             float sample_ori = sift_angle_deg(dy, dx);
-            float obin = (sample_ori - ori) * SIFT_DESCR_BINS_PER_RAD;
-            float w = exp((c_rot * c_rot + r_rot * r_rot) * SIFT_DESCR_EXP_SCALE);
+            float obin = (sample_ori - ori) * bins_per_rad;
+            float w = exp((c_rot * c_rot + r_rot * r_rot) * exp_scale);
 
             int r0 = convert_int_sat_rtn(floor(rbin));
             int c0 = convert_int_sat_rtn(floor(cbin));
