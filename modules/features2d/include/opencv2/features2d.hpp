@@ -264,10 +264,17 @@ typedef AffineFeature AffineDescriptorExtractor;
 (SIFT) algorithm by D. Lowe @cite Lowe04 .
 
 When OpenCV is built with OpenCL, passing cv::UMat inputs to detect(), compute(), or detectAndCompute()
-while OpenCL is enabled (see cv::ocl::setUseOpenCL) may run parts of the pipeline (Gaussian / DoG
-pyramids and an OpenCL extrema prefilter) on the OpenCL device. The implementation automatically falls
-back to the CPU if OpenCL is disabled, kernels are unavailable, or descriptorType is CV_8U. Numerical
-results are expected to agree with the cv::Mat path within small floating-point tolerances.
+while OpenCL is enabled (see cv::ocl::setUseOpenCL) runs the full SIFT pipeline (Gaussian / DoG
+pyramids, extrema detection, orientation assignment, and descriptor computation) on the OpenCL device
+for images larger than approximately 640×480 pixels. Smaller images automatically fall back to the CPU
+path to avoid kernel launch overhead. The implementation also falls back to CPU if OpenCL is disabled,
+kernels are unavailable, or descriptorType is CV_8U. Numerical results are expected to agree with the
+cv::Mat path within small floating-point tolerances.
+
+Environment variables:
+- OPENCV_SIFT_OPENCL_FULL=1 : force GPU path for all image sizes (including small images)
+- OPENCV_SIFT_CPU_FALLBACK_OCL_MIN_PIXELS=N : override the default 640×480 pixel threshold
+- OPENCV_SIFT_OPENCL_FORCE=1 : skip minimum-size guard inside the GPU path
 */
 class CV_EXPORTS_W SIFT : public Feature2D
 {

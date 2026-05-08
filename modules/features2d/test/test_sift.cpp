@@ -3,6 +3,7 @@
 // of this distribution and at http://opencv.org/license.html
 
 #include "test_precomp.hpp"
+#include "opencv2/core/ocl.hpp"
 
 namespace opencv_test { namespace {
 
@@ -102,6 +103,55 @@ TEST(Features2d_SIFT, descriptor_norm_range_synthetic)
         EXPECT_GT(norm, 0.0) << "Descriptor row " << i << " is all-zeros";
         // Each element is in [0, 255]; norm <= sqrt(128) * 255 ≈ 2883
         EXPECT_LE(norm, 3000.0) << "Descriptor row " << i << " norm is unexpectedly large";
+    }
+}
+
+// Verify that passing a UMat (large enough to engage GPU path) produces the same
+// descriptors as passing a plain Mat with OpenCL disabled.  The test uses a large
+// synthetic image (1280×720 ≥ 640×480 threshold) so the GPU path is attempted when
+// OpenCL is available, and verifies that Mat/UMat results agree within numerical tolerance.
+TEST(Features2d_SIFT, umat_large_image_descriptors_consistent)
+{
+    // Large enough to exceed the 640×480 GPU threshold
+    const int W = 1280, H = 720;
+    Mat img(H, W, CV_8UC1);
+    for (int r = 0; r < img.rows; r++)
+        for (int c = 0; c < img.cols; c++)
+            img.at<uchar>(r, c) = static_cast<uchar>((r * 17 + c * 13 + (r ^ c) * 7) & 0xFF);
+    GaussianBlur(img, img, Size(5, 5), 1.0);
+
+    auto sift = cv::SIFT::create(200);
+
+    // CPU reference: Mat + OpenCL disabled
+    vector<KeyPoint> kptsCpu;
+    Mat descCpu;
+    ocl::setUseOpenCL(false);
+    sift->detectAndCompute(img, noArray(), kptsCpu, descCpu);
+
+    if (kptsCpu.empty())
+        return; // no keypoints found on this platform
+
+    // Now run with UMat (GPU path attempted when OpenCL is available)
+    UMat uimg;
+    img.copyTo(uimg);
+    vector<KeyPoint> kptsGpu;
+    Mat descGpu;
+    ocl::setUseOpenCL(true);
+    sift->detectAndCompute(uimg, noArray(), kptsGpu, descGpu);
+    ocl::setUseOpenCL(false); // restore
+
+    // Result sizes should match (same algorithm regardless of CPU/GPU backend)
+    ASSERT_EQ(kptsCpu.size(), kptsGpu.size()) << "Keypoint count mismatch between Mat/UMat paths";
+
+    if (!descCpu.empty() && !descGpu.empty())
+    {
+        ASSERT_EQ(descCpu.size(), descGpu.size());
+        // Descriptors may differ by small FP rounding; use L2 norm per row as sanity check
+        for (int i = 0; i < descCpu.rows; i++)
+        {
+            double norm = cv::norm(descCpu.row(i) - descGpu.row(i));
+            EXPECT_LE(norm, 10.0) << "Large descriptor discrepancy at keypoint " << i;
+        }
     }
 }
 
