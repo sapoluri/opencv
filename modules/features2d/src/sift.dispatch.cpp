@@ -646,6 +646,16 @@ namespace cv
 
             void operator()(const cv::Range &range) const CV_OVERRIDE
             {
+                // Try GPU DoG kernel first (if OpenCL available)
+                bool useGpuDoG = ocl::useOpenCL();
+                ocl::Kernel ker;
+                if (useGpuDoG)
+                {
+                    ker = ocl::Kernel("SIFT_computeDoG", ocl::features2d::sift_oclsrc, siftOclBuildOptions());
+                    if (ker.empty())
+                        useGpuDoG = false;
+                }
+
                 for (int a = range.start; a < range.end; a++)
                 {
                     const int o = a / (nOctaveLayers + 2);
@@ -653,7 +663,23 @@ namespace cv
                     const UMat &src1 = gpyr[o * (nOctaveLayers + 3) + i];
                     const UMat &src2 = gpyr[o * (nOctaveLayers + 3) + i + 1];
                     UMat &dst = dogpyr[o * (nOctaveLayers + 2) + i];
-                    subtract(src2, src1, dst, noArray(), CV_32F);
+
+                    if (useGpuDoG)
+                    {
+                        // GPU DoG kernel: keeps data on device, no CPU transfer
+                        size_t globalsize[2] = {(size_t)src1.cols, (size_t)src1.rows};
+                        bool ok = ker.args(
+                                        ocl::KernelArg::PtrReadOnly(src1), (int)src1.step,
+                                        src1.rows, src1.cols,
+                                        ocl::KernelArg::PtrReadOnly(src2), (int)src2.step,
+                                        ocl::KernelArg::PtrWriteOnly(dst), (int)dst.step)
+                                     .run(2, globalsize, nullptr, false);
+                        if (!ok)
+                            useGpuDoG = false;  // Fall back to CPU on any kernel failure
+                    }
+
+                    if (!useGpuDoG)
+                        subtract(src2, src1, dst, noArray(), CV_32F);
                 }
             }
 

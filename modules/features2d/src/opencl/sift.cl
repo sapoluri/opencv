@@ -17,6 +17,28 @@ inline float read_dog_layer(__global const uchar* base, int step_bytes, int laye
     return *(__global const float*)(base + (size_t)rr * (size_t)step_bytes + (size_t)c * sizeof(float));
 }
 
+// GPU Difference-of-Gaussians kernel: keeps computation on device, no CPU transfer needed.
+// This eliminates the hidden sync point in CPU-based DoG computation.
+__kernel void SIFT_computeDoG(
+    __global const uchar* restrict src1_base, int src1_step, int src1_rows, int src1_cols,
+    __global const uchar* restrict src2_base, int src2_step,
+    __global uchar* restrict dst_base, int dst_step)
+{
+    int c = (int)get_global_id(0);
+    int r = (int)get_global_id(1);
+    
+    if (r >= src1_rows || c >= src1_cols)
+        return;
+    
+    // Read src1[r,c] and src2[r,c] as float
+    __global float* src1_row = (__global float*)(src1_base + (size_t)r * (size_t)src1_step);
+    __global float* src2_row = (__global float*)(src2_base + (size_t)r * (size_t)src2_step);
+    __global float* dst_row = (__global float*)(dst_base + (size_t)r * (size_t)dst_step);
+    
+    // Compute DoG: dst = src2 - src1
+    dst_row[c] = src2_row[c] - src1_row[c];
+}
+
 // First-pass DoG extrema test (matches scalar path in sift.simd.hpp).
 __kernel void SIFT_collectExtremaCandidates(
     __global const uchar* restrict prev_base, int prev_step,
