@@ -118,7 +118,7 @@ TEST(Features2d_SIFT, umat_large_image_descriptors_consistent)
     // Use a pattern that reliably produces keypoints: stripes with varying frequency
     for (int r = 0; r < img.rows; r++)
         for (int c = 0; c < img.cols; c++)
-            img.at<uchar>(r, c) = static_cast<uchar>(
+            img.at<uchar>(r, c) = cv::saturate_cast<uchar>(
                 128 + 100 * std::sin(r * 0.07f) * std::cos(c * 0.05f) +
                 50 * std::sin(r * 0.03f + c * 0.04f));
     GaussianBlur(img, img, Size(3, 3), 1.0);
@@ -126,7 +126,7 @@ TEST(Features2d_SIFT, umat_large_image_descriptors_consistent)
     auto sift = cv::SIFT::create(200);
 
     // Save and restore OpenCL state to avoid test order dependency
-    const bool origOclState = ocl::useOpenCL();
+    const bool prevOclState = ocl::useOpenCL();
 
     // CPU reference: Mat + OpenCL disabled
     vector<KeyPoint> kptsCpu;
@@ -135,7 +135,7 @@ TEST(Features2d_SIFT, umat_large_image_descriptors_consistent)
     sift->detectAndCompute(img, noArray(), kptsCpu, descCpu);
 
     // Restore original OCL state before GPU run
-    ocl::setUseOpenCL(origOclState);
+    ocl::setUseOpenCL(prevOclState);
 
     // Now run with UMat (GPU path attempted when OpenCL is available)
     UMat uimg;
@@ -145,7 +145,7 @@ TEST(Features2d_SIFT, umat_large_image_descriptors_consistent)
     sift->detectAndCompute(uimg, noArray(), kptsGpu, descGpu);
 
     // Restore original OCL state
-    ocl::setUseOpenCL(origOclState);
+    ocl::setUseOpenCL(prevOclState);
 
     // Both paths must detect keypoints on this synthetic image
     EXPECT_FALSE(kptsCpu.empty()) << "CPU path found no keypoints on synthetic image";
