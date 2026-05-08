@@ -115,12 +115,18 @@ TEST(Features2d_SIFT, umat_large_image_descriptors_consistent)
     // Large enough to exceed the 640×480 GPU threshold
     const int W = 1280, H = 720;
     Mat img(H, W, CV_8UC1);
+    // Use a pattern that reliably produces keypoints: stripes with varying frequency
     for (int r = 0; r < img.rows; r++)
         for (int c = 0; c < img.cols; c++)
-            img.at<uchar>(r, c) = static_cast<uchar>((r * 17 + c * 13 + (r ^ c) * 7) & 0xFF);
-    GaussianBlur(img, img, Size(5, 5), 1.0);
+            img.at<uchar>(r, c) = static_cast<uchar>(
+                128 + 100 * std::sin(r * 0.07f) * std::cos(c * 0.05f) +
+                50 * std::sin(r * 0.03f + c * 0.04f));
+    GaussianBlur(img, img, Size(3, 3), 1.0);
 
     auto sift = cv::SIFT::create(200);
+
+    // Save and restore OpenCL state to avoid test order dependency
+    const bool origOclState = ocl::useOpenCL();
 
     // CPU reference: Mat + OpenCL disabled
     vector<KeyPoint> kptsCpu;
@@ -128,17 +134,25 @@ TEST(Features2d_SIFT, umat_large_image_descriptors_consistent)
     ocl::setUseOpenCL(false);
     sift->detectAndCompute(img, noArray(), kptsCpu, descCpu);
 
-    if (kptsCpu.empty())
-        return; // no keypoints found on this platform
+    // Restore original OCL state before GPU run
+    ocl::setUseOpenCL(origOclState);
 
     // Now run with UMat (GPU path attempted when OpenCL is available)
     UMat uimg;
     img.copyTo(uimg);
     vector<KeyPoint> kptsGpu;
     Mat descGpu;
-    ocl::setUseOpenCL(true);
     sift->detectAndCompute(uimg, noArray(), kptsGpu, descGpu);
-    ocl::setUseOpenCL(false); // restore
+
+    // Restore original OCL state
+    ocl::setUseOpenCL(origOclState);
+
+    // Both paths must detect keypoints on this synthetic image
+    EXPECT_FALSE(kptsCpu.empty()) << "CPU path found no keypoints on synthetic image";
+    EXPECT_FALSE(kptsGpu.empty()) << "GPU/CPU path found no keypoints on synthetic image";
+
+    if (kptsCpu.empty() || kptsGpu.empty())
+        return;
 
     // Result sizes should match (same algorithm regardless of CPU/GPU backend)
     ASSERT_EQ(kptsCpu.size(), kptsGpu.size()) << "Keypoint count mismatch between Mat/UMat paths";
