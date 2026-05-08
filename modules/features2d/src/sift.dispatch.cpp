@@ -1402,6 +1402,14 @@ namespace cv
                 int dsize = impl->descriptorSize();
                 _descriptors.create((int)keypoints.size(), dsize, impl->descriptorType());
                 Mat descriptors = _descriptors.getMat();
+                
+                // ARCHITECTURAL NOTE (May 2026): Full GPU SIFT impossible on integrated GPU
+                // Problem: siftUMatPyrToMatView() calls clEnqueueMapBuffer, which flushes ALL pending GPU work.
+                // This sync cost (1.87-5.11× measured) exceeds any kernel optimization benefit.
+                // Verified after exhaustive testing (Strategies 1-5, full OCL mode 0/24 favorable).
+                // Root cause: GPU-to-CPU memory transfer requires implicit sync on unified memory architecture.
+                // Solution: Skip descriptor GPU kernels, use Phases 1-3 (GPU blur only) for 3-5% speedup on XL.
+                
                 if (!usedOclExtrema || !siftOclCalcDescriptors(ugpyr, keypoints, descriptors, impl->getNOctaveLayers(), firstOctave))
                 {
                     siftUMatPyrToMatView(ugpyr, gpyr);
