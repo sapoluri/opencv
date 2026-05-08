@@ -3,6 +3,7 @@
 // of this distribution and at http://opencv.org/license.html
 
 #include "test_precomp.hpp"
+#include "opencv2/core/ocl.hpp"
 
 namespace opencv_test { namespace {
 
@@ -102,6 +103,64 @@ TEST(Features2d_SIFT, descriptor_norm_range_synthetic)
         EXPECT_GT(norm, 0.0) << "Descriptor row " << i << " is all-zeros";
         // Each element is in [0, 255]; norm <= sqrt(128) * 255 ≈ 2883
         EXPECT_LE(norm, 3000.0) << "Descriptor row " << i << " norm is unexpectedly large";
+    }
+}
+
+// Verify that passing a UMat (large enough to engage GPU path) produces the same
+// descriptors as passing a plain Mat with OpenCL disabled.  The test uses a large
+// synthetic image (1280×720 ≥ 640×480 threshold) so the GPU path is attempted when
+// OpenCL is available, and verifies that Mat/UMat results agree within numerical tolerance.
+TEST(Features2d_SIFT, umat_large_image_descriptors_consistent)
+{
+    // Large enough to exceed the 640×480 GPU threshold
+    const int W = 1280, H = 720;
+    Mat img(H, W, CV_8UC1);
+    // Use a pattern that reliably produces keypoints: stripes with varying frequency
+    for (int r = 0; r < img.rows; r++)
+        for (int c = 0; c < img.cols; c++)
+            img.at<uchar>(r, c) = cv::saturate_cast<uchar>(
+                128 + 100 * std::sin(r * 0.07f) * std::cos(c * 0.05f) +
+                50 * std::sin(r * 0.03f + c * 0.04f));
+    GaussianBlur(img, img, Size(3, 3), 1.0);
+
+    auto sift = cv::SIFT::create(200);
+
+    // Save OpenCL state and disable it for the CPU reference run.
+    const bool prevOclState = ocl::useOpenCL();
+    ocl::setUseOpenCL(false);
+
+    // CPU reference: Mat + OpenCL disabled
+    vector<KeyPoint> kptsCpu;
+    Mat descCpu;
+    sift->detectAndCompute(img, noArray(), kptsCpu, descCpu);
+
+    // Run with UMat under original OCL state (GPU path is attempted if OpenCL is available)
+    ocl::setUseOpenCL(prevOclState);
+    UMat uimg;
+    img.copyTo(uimg);
+    vector<KeyPoint> kptsGpu;
+    Mat descGpu;
+    sift->detectAndCompute(uimg, noArray(), kptsGpu, descGpu);
+
+    // Both paths must detect keypoints on this synthetic image
+    EXPECT_FALSE(kptsCpu.empty()) << "CPU path found no keypoints on synthetic image";
+    EXPECT_FALSE(kptsGpu.empty()) << "GPU/CPU path found no keypoints on synthetic image";
+
+    if (kptsCpu.empty() || kptsGpu.empty())
+        return;
+
+    // Result sizes should match (same algorithm regardless of CPU/GPU backend)
+    ASSERT_EQ(kptsCpu.size(), kptsGpu.size()) << "Keypoint count mismatch between Mat/UMat paths";
+
+    if (!descCpu.empty() && !descGpu.empty())
+    {
+        ASSERT_EQ(descCpu.size(), descGpu.size());
+        // Descriptors may differ by small FP rounding; use L2 norm per row as sanity check
+        for (int i = 0; i < descCpu.rows; i++)
+        {
+            double norm = cv::norm(descCpu.row(i) - descGpu.row(i));
+            EXPECT_LE(norm, 10.0) << "Large descriptor discrepancy at keypoint " << i;
+        }
     }
 }
 

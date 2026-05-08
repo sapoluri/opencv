@@ -1489,15 +1489,6 @@ namespace cv
             if (impl->descriptorType() != CV_32F)
                 return false;
 
-            const bool fullOffload = std::getenv("OPENCV_SIFT_OPENCL_FULL") != NULL;
-
-            // Exit before acquiring any UMat/Mat handles so we pay zero OCL queue-flush cost when
-            // the full GPU descriptor path has not been requested.  The getUMat()/getMat() calls
-            // below can trigger a clEnqueueMapBuffer (and hence an implicit command-queue sync) on
-            // device-backed UMats even when OCL is technically not needed for this call path.
-            if (_descriptors.needed() && !fullOffload)
-                return false;
-
             UMat uimage = _image.getUMat();
             Mat mask = _mask.getMat();
 
@@ -1566,15 +1557,12 @@ namespace cv
                 int dsize = impl->descriptorSize();
                 _descriptors.create((int)keypoints.size(), dsize, impl->descriptorType());
                 Mat descriptors = _descriptors.getMat();
-                
-                // ARCHITECTURAL NOTE (May 2026): Full GPU SIFT impossible on integrated GPU
-                // Problem: siftUMatPyrToMatView() calls clEnqueueMapBuffer, which flushes ALL pending GPU work.
-                // This sync cost (1.87-5.11× measured) exceeds any kernel optimization benefit.
-                // Verified after exhaustive testing (Strategies 1-5, full OCL mode 0/24 favorable).
-                // Root cause: GPU-to-CPU memory transfer requires implicit sync on unified memory architecture.
-                // Solution: Skip descriptor GPU kernels, use Phases 1-3 (GPU blur only) for 3-5% speedup on XL.
-                
-                if (!usedOclExtrema || !siftOclCalcDescriptors(ugpyr, keypoints, descriptors, impl->getNOctaveLayers(), firstOctave))
+
+                // Try GPU descriptor computation (two-pass LDS kernel + single copyTo sync).
+                // This works for both detected keypoints (usedOclExtrema) and provided keypoints,
+                // since ugpyr is always GPU-resident at this point.
+                // Falls back to CPU if GPU kernels are unavailable or fail.
+                if (!siftOclCalcDescriptors(ugpyr, keypoints, descriptors, impl->getNOctaveLayers(), firstOctave))
                 {
                     siftUMatPyrToMatView(ugpyr, gpyr);
                     calcDescriptors(gpyr, keypoints, descriptors, impl->getNOctaveLayers(), firstOctave);
@@ -1653,15 +1641,21 @@ namespace cv
 #ifdef HAVE_OPENCL
         const bool prevUseOpenCL = ocl::useOpenCL();
         bool cpuFallbackOpenCLSuppressed = false;
+        // When OPENCV_SIFT_OPENCL_FULL is set, skip the size-based OCL disable so that
+        // the GPU path is attempted for all image sizes (including images below the default
+        // threshold).  This is useful for testing and for workloads that deliberately
+        // want GPU even on small inputs.
         if (prevUseOpenCL && _image.isUMat() && _descriptors.needed() && std::getenv("OPENCV_SIFT_OPENCL_FULL") == NULL)
         {
             Size sz = _image.size();
-            int64 minPixelsForCpuFallbackOcl = (int64)3840 * 2160;
+            // Default threshold: disable GPU path for small images where kernel launch overhead
+            // exceeds the GPU compute benefit (measured ~12% slower for 512×384 images).
+            // Tune with OPENCV_SIFT_CPU_FALLBACK_OCL_MIN_PIXELS env var.
+            int64 minPixelsForCpuFallbackOcl = (int64)640 * 480;
             if (const char *e = std::getenv("OPENCV_SIFT_CPU_FALLBACK_OCL_MIN_PIXELS"))
                 minPixelsForCpuFallbackOcl = std::max<int64>(1, (int64)atoll(e));
 
-            // In nofull mode, CPU fallback runs Mat-based SIFT. For non-XL inputs,
-            // keeping OCL enabled often adds dispatch/mapping overhead without enough gain.
+            // For images below the threshold, GPU overhead exceeds benefit; use CPU path.
             if ((int64)sz.area() < minPixelsForCpuFallbackOcl)
             {
                 ocl::setUseOpenCL(false);

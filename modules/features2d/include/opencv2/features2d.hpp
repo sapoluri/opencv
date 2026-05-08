@@ -264,10 +264,24 @@ typedef AffineFeature AffineDescriptorExtractor;
 (SIFT) algorithm by D. Lowe @cite Lowe04 .
 
 When OpenCV is built with OpenCL, passing cv::UMat inputs to detect(), compute(), or detectAndCompute()
-while OpenCL is enabled (see cv::ocl::setUseOpenCL) may run parts of the pipeline (Gaussian / DoG
-pyramids and an OpenCL extrema prefilter) on the OpenCL device. The implementation automatically falls
-back to the CPU if OpenCL is disabled, kernels are unavailable, or descriptorType is CV_8U. Numerical
-results are expected to agree with the cv::Mat path within small floating-point tolerances.
+while OpenCL is enabled (see cv::ocl::setUseOpenCL) runs the full SIFT pipeline (Gaussian / DoG
+pyramids, extrema detection, orientation assignment, and descriptor computation) on the OpenCL device
+for images larger than approximately 640×480 pixels. Smaller images automatically fall back to the CPU
+path to avoid kernel launch overhead. The implementation also falls back to CPU if OpenCL is disabled,
+kernels are unavailable, or descriptorType is CV_8U. Numerical results are expected to agree with the
+cv::Mat path within small floating-point tolerances.
+
+Environment variables for tuning GPU behaviour:
+- OPENCV_SIFT_CPU_FALLBACK_OCL_MIN_PIXELS=N : override the outer size threshold (default 640×480).
+  Images with fewer pixels disable OpenCL before calling the GPU path. Use a smaller value to
+  enable GPU for smaller images, or 0 to always attempt GPU regardless of image size.
+- OPENCV_SIFT_OPENCL_FULL=1 : equivalent to OPENCV_SIFT_CPU_FALLBACK_OCL_MIN_PIXELS=0; bypasses
+  the outer size-based GPU disable so that GPU is attempted for all image sizes.
+- OPENCV_SIFT_OPENCL_MIN_PIXELS=N, OPENCV_SIFT_OPENCL_MIN_SIDE=N : fine-tune the secondary
+  size guard inside `siftTryOpenCLDetectAndCompute` (defaults: ~196608 px / 384 px shorter side).
+  Images below either limit return false from the GPU path even when the outer threshold is met.
+- OPENCV_SIFT_OPENCL_FORCE=1 : bypass the secondary size guard inside the GPU path entirely
+  (useful when OPENCV_SIFT_OPENCL_FULL is also set and very small images must run on GPU).
 */
 class CV_EXPORTS_W SIFT : public Feature2D
 {
