@@ -125,26 +125,25 @@ TEST(Features2d_SIFT, umat_large_image_descriptors_consistent)
 
     auto sift = cv::SIFT::create(200);
 
-    // Save and restore OpenCL state to avoid test order dependency
+    // Save OpenCL state and disable it for the CPU reference run.
     const bool prevOclState = ocl::useOpenCL();
+    ocl::setUseOpenCL(false);
 
     // CPU reference: Mat + OpenCL disabled
     vector<KeyPoint> kptsCpu;
     Mat descCpu;
-    ocl::setUseOpenCL(false);
     sift->detectAndCompute(img, noArray(), kptsCpu, descCpu);
 
-    // Restore original OCL state before GPU run
+    // Run with UMat under original OCL state (GPU path is attempted if OpenCL is available)
     ocl::setUseOpenCL(prevOclState);
-
-    // Now run with UMat (GPU path attempted when OpenCL is available)
     UMat uimg;
     img.copyTo(uimg);
     vector<KeyPoint> kptsGpu;
     Mat descGpu;
     sift->detectAndCompute(uimg, noArray(), kptsGpu, descGpu);
 
-    // Restore original OCL state
+    // Restore original OCL state (no-op if prevOclState was already restored above,
+    // but explicit here so the finally-reached state is always prevOclState).
     ocl::setUseOpenCL(prevOclState);
 
     // Both paths must detect keypoints on this synthetic image

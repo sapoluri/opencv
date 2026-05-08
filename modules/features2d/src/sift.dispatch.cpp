@@ -1641,6 +1641,10 @@ namespace cv
 #ifdef HAVE_OPENCL
         const bool prevUseOpenCL = ocl::useOpenCL();
         bool cpuFallbackOpenCLSuppressed = false;
+        // When OPENCV_SIFT_OPENCL_FULL is set, skip the size-based OCL disable so that
+        // the GPU path is attempted for all image sizes (including images below the default
+        // threshold).  This is useful for testing and for workloads that deliberately
+        // want GPU even on small inputs.
         if (prevUseOpenCL && _image.isUMat() && _descriptors.needed() && std::getenv("OPENCV_SIFT_OPENCL_FULL") == NULL)
         {
             Size sz = _image.size();
