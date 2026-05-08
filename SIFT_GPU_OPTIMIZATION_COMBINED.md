@@ -573,3 +573,192 @@ if (_descriptors.isUMat()) {
 **Framework:** OpenCV 4.x  
 **Status:** ✅ READY FOR COMMIT AND DEPLOYMENT
 
+---
+
+# PART 9: MICRO-OPTIMIZATION INVESTIGATION – BATCHED DoG & WARP-LEVEL (MAY 8, 2026)
+
+## Investigation Objective
+
+After achieving 3.6% speedup with cloud agent architecture redesign, we investigated two kernel-level micro-optimizations to further round out SIFT descriptor improvements:
+
+1. **Batched DoG Kernel:** Process multiple pyramid layers per kernel invocation to amortize launch overhead
+2. **Warp-Level Descriptor Normalization:** Use subgroup (warp) shuffle operations for fast parallel reductions
+
+### Rationale
+- DoG kernel launch cost (~1ms) visible on L_large but amortized on XL
+- Warp shuffle should reduce descriptor normalization memory traffic by ~40%
+- Expected combined gain: 2-5% additional speedup
+
+## Implementation & Results
+
+### Batched DoG Kernel
+
+**Design:** 3D kernel (cols × rows × batch_layers) processes multiple DoG layers in single dispatch
+
+```opencl
+__kernel void SIFT_computeDoG_batched(
+    __global const uchar* restrict src1_base, int src1_step, int src1_layer_height,
+    __global const uchar* restrict src2_base, int src2_step,
+    __global uchar* restrict dst_base, int dst_step, int dst_layer_height,
+    int layer_rows, int layer_cols, int batch_count)
+{
+    int c = (int)get_global_id(0);
+    int r = (int)get_global_id(1);
+    int layer_idx = (int)get_global_id(2);
+    
+    if (r >= layer_rows || c >= layer_cols || layer_idx >= batch_count)
+        return;
+    
+    size_t src1_offset = (size_t)layer_idx * (size_t)src1_layer_height * src1_step + r * src1_step;
+    size_t src2_offset = (size_t)layer_idx * (size_t)src2_layer_height * src2_step + r * src2_step;
+    size_t dst_offset = (size_t)layer_idx * (size_t)dst_layer_height * dst_step + r * dst_step;
+    
+    __global const float* src1_row = (__global const float*)(src1_base + src1_offset);
+    __global const float* src2_row = (__global const float*)(src2_base + src2_offset);
+    __global float* dst_row = (__global float*)(dst_base + dst_offset);
+    
+    dst_row[c] = src2_row[c] - src1_row[c];
+}
+```
+
+**Dispatcher:** Batch 4 layers per kernel invocation when processing 2+ layers remaining
+
+### Warp-Level Descriptor Normalization
+
+**Design:** Use `intel_sub_group_shuffle_down()` for parallel reduction (16-element subgroups on Arc)
+
+```opencl
+// Warp-level reduce (uses subgroup shuffle for inter-lane communication)
+float nrm2 = local_nrm2;
+nrm2 += intel_sub_group_shuffle_down(nrm2, 1, 16);
+nrm2 += intel_sub_group_shuffle_down(nrm2, 2, 16);
+nrm2 += intel_sub_group_shuffle_down(nrm2, 4, 16);
+nrm2 += intel_sub_group_shuffle_down(nrm2, 8, 16);
+nrm2 = intel_sub_group_shuffle(nrm2, 0, 16);  // Broadcast
+```
+
+## Benchmark Results
+
+**Baseline (Cloud Agent + GPU DoG kernel):**
+- Average: 0.974×
+- Favorable: 13/24
+- Geometric mean: 0.966×
+
+**With Batched DoG + Warp Optimization:**
+- Average: 0.994×
+- Favorable: 10/24
+- Geometric mean: 0.982×
+- **Change: -2.1% regression, -3 favorable cases**
+
+### Detailed Impact by Size
+
+| Size | Baseline | Result | Change | Verdict |
+|---|---:|---:|---:|---|
+| S_small | 1.130× | 1.130× | ±0.0% | Neutral |
+| M_medium | 0.928× | 0.990× | -6.6% | ❌ MAJOR REG |
+| L_large | 0.878× | 0.925× | -5.3% | ❌ REG |
+| XL_very_large | 0.948× | 0.930× | +3.0% | ✅ Gain (only) |
+
+### Critical Regressions
+
+| Case | Before | After | Change |
+|---|---:|---:|---:|
+| L_large,layers5 | 0.78× | 1.01× | **-29.5%** |
+| M_medium,cap500 | 0.82× | 1.01× | **-23.2%** |
+| M_medium,contrast_hi | 0.83× | 1.01× | **-21.7%** |
+| L_large,cap500 | 1.00× | 1.05× | -5.0% |
+| M_medium,layers5 | 1.01× | 1.04× | -3.0% |
+
+### Small Improvements (Hidden by Regressions)
+
+| Case | Before | After | Change |
+|---|---:|---:|---:|
+| XL_very_large,cap500 | 0.99× | 0.93× | +6.1% ✅ |
+| XL_very_large,edge_tight | 0.99× | 0.94× | +5.1% ✅ |
+| M_medium,def_nL3 | 0.89× | 0.86× | +3.4% ✅ |
+| XL_very_large,sigma_soft | 0.98× | 0.95× | +3.1% ✅ |
+
+## Root Cause Analysis
+
+### Batched DoG Kernel Issues
+
+**Problem 1: Incorrect Layer Offset Calculation**
+```cpp
+// Assumed stacked buffer layout was incorrect
+size_t offset = layer_idx * layer_height * step + row * step;
+// This assumes contiguous layer storage, but UMat pyramid uses separate allocations
+```
+
+**Problem 2: 3D Kernel Dispatch Inefficiency**
+- Intel Arc subgroup size: 16 elements
+- 3D dispatch on Arc adds complexity to work item scheduling
+- 2D dispatch (cols × rows) per layer was already optimal
+
+**Problem 3: L_large Regression Pattern**
+- 23% regression on M_medium cap500 (1280×720)
+- 29% regression on L_large layers5 (1920×1080, 81k keypoints)
+- Pattern suggests batched kernel NOT executing correctly (falling back to serial?)
+- Possible dispatcher fallback condition never triggered successful GPU path
+
+### Warp-Level Normalization Issues
+
+**Problem 1: Subgroup Function Availability**
+- `intel_sub_group_shuffle_down()` may not be available on Intel Arc
+- Fallback to standard reduction if extension not supported
+- Unclear if extension successfully loaded in build
+
+**Problem 2: Subgroup Size Mismatch**
+- Hardcoded 16-element subgroup but Arc may have different grouping
+- No error on compilation, but shuffle operations may be no-ops
+
+**Problem 3: Occupancy Impact**
+- Warp shuffle relies on tight wave scheduling
+- May conflict with LDS allocations in descriptor kernel
+- Could reduce occupancy or increase register pressure
+
+## Decision: Revert
+
+**Conclusion:** Batched DoG + Warp optimizations caused **net regression** and were reverted.
+
+**Reasoning:**
+1. 2.1% average slowdown unacceptable (negates gain from architecture fix)
+2. Lost 3 favorable cases (13 → 10), primarily from M_medium/L_large
+3. Large individual regressions (23-29%) in critical workloads
+4. XL gains (+3-6%) insufficient to offset M_medium/L_large losses
+5. Root causes complex (buffer layout, dispatch logic, extension availability)
+6. Risk of introducing subtle GPU bugs for marginal return
+
+**Status:** ✅ **Kept GPU DoG kernel only** (stable +1.4% on XL, -0.3% net)
+
+---
+
+## Lessons Learned
+
+### Micro-Optimization Diminishing Returns
+- After fixing architecture (sync overhead), kernel tuning provides 2-5% each
+- But tuning requires architecture-specific knowledge
+- Intel Arc subgroups differ from NVIDIA or AMD patterns
+- Portable OpenCL optimizations challenging
+
+### The 5% Barrier
+- Below 5% gains, noise and thermal variance dominate
+- Hard to distinguish real improvement from measurement error
+- Regression >2% immediately visible in real workloads
+- Better to keep simple, proven code
+
+### GPU Kernel Launch Overhead Is Real
+- DoG kernel launch: ~1ms per layer
+- At L_large (6 DoG layers), adds ~6ms = 2-3% of total
+- Batching COULD help, but implementation complexity high
+- CPU subtract() already SIMD-optimized, hard to beat
+
+### Recommendation for Future Work
+
+1. **Don't optimize below 5% target:** Noise dominates, diminishing returns
+2. **Profile before optimizing:** Understand actual bottlenecks with intel_gpu_top
+3. **Test on multiple GPU architectures:** Intel Arc ≠ NVIDIA ≠ AMD (different subgroup sizes, LDS patterns)
+4. **Keep architecture fixes separate from micro-tuning:** Focus on removing sync, then tune kernels
+5. **Accept limitations:** CPU SIMD is hard to beat on small images/simple operations
+
+---
+

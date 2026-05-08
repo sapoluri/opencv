@@ -1274,15 +1274,17 @@ namespace cv
                 uCounterSlices[(size_t)j] = uCounterOctave.rowRange(j, j + 1);
 
             UMat uPrevDev, uCurDev, uNextDev;
-            ocl::Kernel ker("SIFT_collectExtremaCandidates", ocl::features2d::sift_oclsrc, siftOclBuildOptions());
-            if (ker.empty())
-                return false;
 
             std::vector<std::vector<int>> rcLists((size_t)nOctaves * (size_t)nOctaveLayers);
             std::vector<int> rcCounts((size_t)nOctaves * (size_t)nOctaveLayers, 0);
 
             for (int o = 0; o < nOctaves; o++)
             {
+                // Create a fresh kernel for each octave to avoid kernel reuse violations in async mode
+                ocl::Kernel ker("SIFT_collectExtremaCandidates", ocl::features2d::sift_oclsrc, siftOclBuildOptions());
+                if (ker.empty())
+                    return false;
+
                 const int octaveBase = o * (nOctaveLayers + 2);
                 siftCopyToDeviceBuffer(udog_pyr[(size_t)octaveBase], uPrevDev);
                 siftCopyToDeviceBuffer(udog_pyr[(size_t)(octaveBase + 1)], uCurDev);
@@ -1326,6 +1328,9 @@ namespace cv
                                   .run(2, globalsize, localsize[0] ? localsize : nullptr, false); // non-blocking
                     if (!ok)
                         return false;
+                    
+                    // Add explicit finish to prevent async kernel reuse violation within loop
+                    ocl::finish();
 
                     if (i < nOctaveLayers)
                     {
