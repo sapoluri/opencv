@@ -2,9 +2,11 @@
  * End-to-end SIFT + matching + homography benchmark.
  *
  * Modes:
- *   baseline   : BFMatcher + RANSAC
+ *   baseline   : BFMatcher(CPU Mat) + RANSAC
+ *   match_ocl  : BFMatcher(OpenCL UMat) + RANSAC
  *   match_opt  : FLANN(KDTree) + RANSAC
- *   ransac_opt : BFMatcher + RHO
+ *   ransac_opt : BFMatcher(CPU Mat) + RHO
+ *   both_ocl   : BFMatcher(OpenCL UMat) + RHO
  *   both       : FLANN(KDTree) + RHO
  */
 
@@ -27,7 +29,7 @@ using std::endl;
 using std::string;
 using std::vector;
 
-enum MatchMode { MATCH_BF = 0, MATCH_FLANN = 1 };
+enum MatchMode { MATCH_BF_CPU = 0, MATCH_BF_OCL = 1, MATCH_FLANN = 2 };
 enum RansacMode { RANSAC_CLASSIC = 0, RANSAC_RHO = 1 };
 
 struct BenchmarkConfig {
@@ -39,8 +41,8 @@ struct BenchmarkConfig {
     double ransacThreshold = 3.0;
     double ransacConfidence = 0.995;
     int ransacMaxIters = 2000;
-    int maxMatchDescriptors = 240000;
-    MatchMode matchMode = MATCH_BF;
+    int maxMatchDescriptors = 0;  // 0 = no cap (FLANN); BF modes always capped at 65535 (IMGIDX_ONE)
+    MatchMode matchMode = MATCH_BF_CPU;
     RansacMode ransacMode = RANSAC_CLASSIC;
 };
 
@@ -55,6 +57,7 @@ struct StageStats {
     double matchMs = 0.0;
     double ransacMs = 0.0;
     double totalMs = 0.0;
+    int oclMatchFallbacks = 0;
 };
 
 static Mat makeSyntheticGray(int w, int h, uint64_t seed)
@@ -166,15 +169,21 @@ static StageStats runPipeline(const Mat& img1Cpu, const Mat& img2Cpu, const Benc
         s.sift2Ms += tm.getTimeMilli();
         tm.reset();
 
-        if (useUmat)
+        // BFMatcher has a hard architectural limit of 65535 descriptors (IMGIDX_ONE).
+        // Cap only for BF modes to avoid an assertion crash; FLANN is uncapped.
+        if (cfg.matchMode == MATCH_BF_CPU || cfg.matchMode == MATCH_BF_OCL)
         {
-            capKeypointsAndDescriptors(k1, d1u, cfg.maxMatchDescriptors);
-            capKeypointsAndDescriptors(k2, d2u, cfg.maxMatchDescriptors);
-        }
-        else
-        {
-            capKeypointsAndDescriptors(k1, d1m, cfg.maxMatchDescriptors);
-            capKeypointsAndDescriptors(k2, d2m, cfg.maxMatchDescriptors);
+            const int bfCap = std::min(cfg.maxMatchDescriptors > 0 ? cfg.maxMatchDescriptors : 65535, 65535);
+            if (useUmat)
+            {
+                capKeypointsAndDescriptors(k1, d1u, bfCap);
+                capKeypointsAndDescriptors(k2, d2u, bfCap);
+            }
+            else
+            {
+                capKeypointsAndDescriptors(k1, d1m, bfCap);
+                capKeypointsAndDescriptors(k2, d2m, bfCap);
+            }
         }
 
         if (it == 0)
@@ -188,10 +197,41 @@ static StageStats runPipeline(const Mat& img1Cpu, const Mat& img2Cpu, const Benc
 
         vector<vector<DMatch> > knn;
         tm.start();
-        if (cfg.matchMode == MATCH_BF)
+        if (cfg.matchMode == MATCH_BF_CPU)
         {
-            if (useUmat) bf.knnMatch(d1u, d2u, knn, 2);
-            else bf.knnMatch(d1m, d2m, knn, 2);
+            if (useUmat)
+            {
+                d1m = d1u.getMat(ACCESS_READ);
+                d2m = d2u.getMat(ACCESS_READ);
+            }
+            bf.knnMatch(d1m, d2m, knn, 2);
+        }
+        else if (cfg.matchMode == MATCH_BF_OCL)
+        {
+            // Direct OCL BF path for measurement; fall back to CPU BF if driver rejects UMat handles.
+            bool matched = false;
+            if (useUmat)
+            {
+                try
+                {
+                    bf.knnMatch(d1u, d2u, knn, 2);
+                    matched = true;
+                }
+                catch (const cv::Exception&)
+                {
+                    matched = false;
+                }
+            }
+            if (!matched)
+            {
+                if (useUmat)
+                {
+                    d1m = d1u.getMat(ACCESS_READ);
+                    d2m = d2u.getMat(ACCESS_READ);
+                }
+                bf.knnMatch(d1m, d2m, knn, 2);
+                s.oclMatchFallbacks++;
+            }
         }
         else
         {
@@ -252,7 +292,12 @@ static void applyMode(const string& mode, BenchmarkConfig& cfg)
 {
     if (mode == "baseline")
     {
-        cfg.matchMode = MATCH_BF;
+        cfg.matchMode = MATCH_BF_CPU;
+        cfg.ransacMode = RANSAC_CLASSIC;
+    }
+    else if (mode == "match_ocl")
+    {
+        cfg.matchMode = MATCH_BF_OCL;
         cfg.ransacMode = RANSAC_CLASSIC;
     }
     else if (mode == "match_opt")
@@ -262,7 +307,12 @@ static void applyMode(const string& mode, BenchmarkConfig& cfg)
     }
     else if (mode == "ransac_opt")
     {
-        cfg.matchMode = MATCH_BF;
+        cfg.matchMode = MATCH_BF_CPU;
+        cfg.ransacMode = RANSAC_RHO;
+    }
+    else if (mode == "both_ocl")
+    {
+        cfg.matchMode = MATCH_BF_OCL;
         cfg.ransacMode = RANSAC_RHO;
     }
     else if (mode == "both")
@@ -316,6 +366,7 @@ int main(int argc, char** argv)
          << std::setw(8) << "Kp2"
          << std::setw(10) << "RawM"
          << std::setw(10) << "GoodM"
+            << std::setw(8) << "OCLfb"
          << std::setw(10) << "Inliers"
          << std::setw(12) << "SIFT1"
          << std::setw(12) << "SIFT2"
@@ -323,7 +374,7 @@ int main(int argc, char** argv)
          << std::setw(12) << "RANSAC"
          << std::setw(12) << "Total"
          << "\n";
-    cout << string(127, '-') << "\n";
+        cout << string(135, '-') << "\n";
 
     for (size_t i = 0; i < cases.size(); ++i)
     {
@@ -343,6 +394,7 @@ int main(int argc, char** argv)
              << std::setw(8) << r.kpts2
              << std::setw(10) << r.rawMatches
              << std::setw(10) << r.goodMatches
+               << std::setw(8) << r.oclMatchFallbacks
              << std::setw(10) << r.inliers
              << std::fixed << std::setprecision(2)
              << std::setw(12) << r.sift1Ms
@@ -355,6 +407,6 @@ int main(int argc, char** argv)
 
     cout << "\nNotes:\n";
     cout << "- Set OPENCV_OPENCL_DEVICE=:GPU:0 and OPENCV_SIFT_OPENCL_FULL=1 for full GPU SIFT path.\n";
-    cout << "- Modes: baseline, match_opt, ransac_opt, both\n";
+    cout << "- Modes: baseline, match_ocl, match_opt, ransac_opt, both_ocl, both\n";
     return 0;
 }

@@ -663,6 +663,8 @@ namespace cv
                     const UMat &src1 = gpyr[o * (nOctaveLayers + 3) + i];
                     const UMat &src2 = gpyr[o * (nOctaveLayers + 3) + i + 1];
                     UMat &dst = dogpyr[o * (nOctaveLayers + 2) + i];
+                    if (dst.empty() || dst.size() != src1.size() || dst.type() != src1.type())
+                        dst.create(src1.size(), src1.type());
 
                     if (useGpuDoG)
                     {
@@ -1253,25 +1255,21 @@ namespace cv
             const double contrastThreshold = impl->getContrastThreshold();
             const double edgeThreshold = impl->getEdgeThreshold();
             const double sigma = impl->getSigma();
-            const int threshold = cvFloor(0.5 * contrastThreshold / nOctaveLayers * 255 * sift_detail::SIFT_FIXPT_SCALE);
+            const float threshold = (float)cvFloor(0.5 * contrastThreshold / nOctaveLayers * 255 * sift_detail::SIFT_FIXPT_SCALE);
 
             const int nOctaves = (int)ugauss_pyr.size() / (nOctaveLayers + 3);
             TLSDataAccumulator<std::vector<SiftOclProvisionalKeypoint>> tls_refined_struct;
-            // Opt-A: per-layer views over one per-octave candidate buffer plus a per-octave counter array.
-            // All nOctaveLayers collect kernels are issued without any intermediate counter readback;
-            // one counter download and one candidate-buffer download per octave flushes all work.
-            UMat uLayerRcOctave(nOctaveLayers * kSiftOclMaxCanPerLayer, 2, CV_32S, USAGE_ALLOCATE_DEVICE_MEMORY);
+            // Use separate per-layer candidate buffers and per-layer counters.
+            // Sub-buffer row slices of a shared buffer require CL_DEVICE_MEM_BASE_ADDR_ALIGN alignment
+            // which OpenCL does not guarantee for 4-byte-stride counter rows on all GPUs.
+            // Using independent UMats per layer avoids this alignment constraint.
             std::vector<UMat> uLayerRcSlices((size_t)nOctaveLayers);
-            for (int j = 0; j < nOctaveLayers; j++)
-            {
-                const int r0 = j * kSiftOclMaxCanPerLayer;
-                uLayerRcSlices[(size_t)j] = uLayerRcOctave.rowRange(r0, r0 + kSiftOclMaxCanPerLayer);
-            }
-            UMat uCounterOctave(nOctaveLayers, 1, CV_32S, USAGE_ALLOCATE_DEVICE_MEMORY);
-            // Pre-build stable row-range sub-UMats so they outlive inner-loop scope across async dispatch.
             std::vector<UMat> uCounterSlices((size_t)nOctaveLayers);
             for (int j = 0; j < nOctaveLayers; j++)
-                uCounterSlices[(size_t)j] = uCounterOctave.rowRange(j, j + 1);
+            {
+                uLayerRcSlices[(size_t)j].create(kSiftOclMaxCanPerLayer, 2, CV_32S, USAGE_ALLOCATE_DEVICE_MEMORY);
+                uCounterSlices[(size_t)j].create(1, 1, CV_32S, USAGE_ALLOCATE_DEVICE_MEMORY);
+            }
 
             UMat uPrevDev, uCurDev, uNextDev;
 
@@ -1280,27 +1278,26 @@ namespace cv
 
             for (int o = 0; o < nOctaves; o++)
             {
-                // Create a fresh kernel for each octave to avoid kernel reuse violations in async mode
-                ocl::Kernel ker("SIFT_collectExtremaCandidates", ocl::features2d::sift_oclsrc, siftOclBuildOptions());
-                if (ker.empty())
-                    return false;
-
                 const int octaveBase = o * (nOctaveLayers + 2);
                 siftCopyToDeviceBuffer(udog_pyr[(size_t)octaveBase], uPrevDev);
                 siftCopyToDeviceBuffer(udog_pyr[(size_t)(octaveBase + 1)], uCurDev);
                 siftCopyToDeviceBuffer(udog_pyr[(size_t)(octaveBase + 2)], uNextDev);
 
-                // Reset all per-layer counters with one GPU write instead of nOctaveLayers separate resets.
-                uCounterOctave.setTo(Scalar(0));
+                // Reset all per-layer counters.
+                for (int j = 0; j < nOctaveLayers; j++)
+                    uCounterSlices[(size_t)j].setTo(Scalar(0));
 
-                // Issue all nOctaveLayers collect kernels for this octave without reading any counter.
-                // The in-order OpenCL queue preserves ordering between kernel dispatches and
-                // the siftCopyToDeviceBuffer calls that feed subsequent layers.
+                // Issue all nOctaveLayers collect kernels for this octave.
                 const ocl::Device &collectDev = ocl::Device::getDefault();
                 const bool collectIsIntelGPU = collectDev.isIntel() && (collectDev.type() & ocl::Device::TYPE_GPU);
 
                 for (int i = 1; i <= nOctaveLayers; i++)
                 {
+                    // Create a fresh kernel per layer to avoid async kernel reuse violations.
+                    ocl::Kernel ker("SIFT_collectExtremaCandidates", ocl::features2d::sift_oclsrc, siftOclBuildOptions());
+                    if (ker.empty())
+                        return false;
+
                     const int idx = o * (nOctaveLayers + 2) + i;
                     const int li = i - 1;
                     int rows = uCurDev.rows, cols = uCurDev.cols;
@@ -1325,12 +1322,9 @@ namespace cv
                                      ocl::KernelArg::PtrReadWrite(uCounterSlices[(size_t)li]),
                                      ocl::KernelArg::PtrWriteOnly(uLayerRcSlices[(size_t)li]),
                                      kSiftOclMaxCanPerLayer)
-                                  .run(2, globalsize, localsize[0] ? localsize : nullptr, false); // non-blocking
+                                  .run(2, globalsize, localsize[0] ? localsize : nullptr, true); // blocking: wait for each layer
                     if (!ok)
                         return false;
-                    
-                    // Add explicit finish to prevent async kernel reuse violation within loop
-                    ocl::finish();
 
                     if (i < nOctaveLayers)
                     {
@@ -1340,25 +1334,26 @@ namespace cv
                     }
                 }
 
-                // One barrier for all nOctaveLayers kernels of this octave.
-                Mat hCounterOctave;
-                uCounterOctave.copyTo(hCounterOctave);
-                Mat hLayerRcOctave;
-                uLayerRcOctave.copyTo(hLayerRcOctave);
-
-                // Download candidates for each layer now that counts are known.
+                // Download candidates for each layer.
                 for (int i = 1; i <= nOctaveLayers; i++)
                 {
                     const int li = i - 1;
-                    const int nCand = hCounterOctave.at<int>(li);
+                    Mat hCounter;
+                    uCounterSlices[(size_t)li].copyTo(hCounter);
+                    const int nCand = hCounter.at<int>(0);
                     if (nCand <= 0)
                         continue;
                     if (nCand >= kSiftOclMaxCanPerLayer - 4096)
                         return false;
                     const int listIdx = o * nOctaveLayers + li;
-                    const int row0 = li * kSiftOclMaxCanPerLayer;
-                    const int *p0 = hLayerRcOctave.ptr<int>(row0);
-                    rcLists[(size_t)listIdx].assign(p0, p0 + nCand * 2);
+                    Mat hLayerRc;
+                    uLayerRcSlices[(size_t)li].rowRange(0, nCand).copyTo(hLayerRc);
+                    rcLists[(size_t)listIdx].resize((size_t)nCand * 2);
+                    for (int k = 0; k < nCand; k++)
+                    {
+                        rcLists[(size_t)listIdx][(size_t)k * 2] = hLayerRc.at<int>(k, 0);
+                        rcLists[(size_t)listIdx][(size_t)k * 2 + 1] = hLayerRc.at<int>(k, 1);
+                    }
                     rcCounts[(size_t)listIdx] = nCand;
                 }
             }
@@ -1541,7 +1536,7 @@ namespace cv
 
                 keypoints.clear();
                 usedOclExtrema = siftOclFindScaleSpaceExtrema(impl, ugpyr, udogpyr, keypoints, NULL);
-                if (!usedOclExtrema)
+                if (!usedOclExtrema || keypoints.empty())
                 {
                     siftUMatPyrToMatView(ugpyr, gpyr);
                     siftUMatPyrToMat(udogpyr, dogpyr);
